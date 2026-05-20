@@ -191,6 +191,31 @@ void CUSBKeyboardDevice::ReportHandler (const u8 *pReport, unsigned nReportSize)
 		nReportSize--;
 	}
 
+	// Translate a 16-byte NKRO bitmap report (byte 0 = modifier, bytes
+	// 1..15 = bitmap, bit N -> HID usage 0x04+N) into a synthetic 8-byte
+	// boot-shape report so the boot decoder below can handle it.
+	u8 BootReport[USBKEYB_REPORT_SIZE];
+	if (pReport != 0 && nReportSize == 16)
+	{
+		memset (BootReport, 0, sizeof BootReport);
+		BootReport[0] = pReport[0];
+		unsigned nKeysFound = 0;
+		for (unsigned nByte = 1; nByte < 16 && nKeysFound < 6; nByte++)
+		{
+			u8 ucBits = pReport[nByte];
+			for (unsigned nBit = 0; ucBits != 0 && nKeysFound < 6; nBit++, ucBits >>= 1)
+			{
+				if (ucBits & 1)
+				{
+					BootReport[2 + nKeysFound++] =
+						0x04 + (nByte - 1) * 8 + nBit;
+				}
+			}
+		}
+		pReport = BootReport;
+		nReportSize = USBKEYB_REPORT_SIZE;
+	}
+
 	if (   pReport == 0
 	    || nReportSize != USBKEYB_REPORT_SIZE)
 	{

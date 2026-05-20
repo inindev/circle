@@ -123,9 +123,22 @@ boolean CUSBHIDDevice::ConfigureHID (unsigned nMaxReportSize)
 	if (m_nMaxReportSize == 0)
 	{
 		m_nMaxReportSize = nMaxReportSize;
-		assert (m_nMaxReportSize > 0);
+	}
 
-		assert (m_pReportBuffer == 0);
+	// Ensure the report buffer is at least the endpoint's max packet size,
+	// otherwise xHCI raises a Babble Detected error when the device sends a
+	// full packet (e.g. non-boot HID keyboards advertising a 16/32/64 byte
+	// interrupt-IN endpoint).
+	unsigned nEPMaxPacketSize = m_pReportEndpoint->GetMaxPacketSize ();
+	if (m_nMaxReportSize < nEPMaxPacketSize)
+	{
+		m_nMaxReportSize = nEPMaxPacketSize;
+	}
+
+	assert (m_nMaxReportSize > 0);
+
+	if (m_pReportBuffer == 0)
+	{
 		m_pReportBuffer = new u8[m_nMaxReportSize];
 	}
 	assert (m_pReportBuffer != 0);
