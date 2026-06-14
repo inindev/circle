@@ -86,6 +86,15 @@ private:
 	u8		 m_uchEndpointID;
 	u8		 m_uchEndpointType;
 
+	// Halt-recovery serialization (mirrors Linux EP_HALTED). Circle's
+	// ResetFromHalted is synchronous, so the failure mode is not concurrent but
+	// REPEATED resets -- one per failed command, each blocking ~3s when the
+	// controller is wedged, which floods the command ring. Once a reset FAILS we
+	// latch this and refuse further reset attempts on this endpoint until a
+	// transfer succeeds (or the device goes away), so a fault storm can't turn
+	// recovery into a self-feeding wedge.
+	volatile boolean m_bResetFailed;
+
 	CUSBRequest	*m_pURB[2];
 	volatile boolean m_bTransferCompleted;
 

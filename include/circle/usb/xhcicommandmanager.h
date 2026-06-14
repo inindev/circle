@@ -59,6 +59,11 @@ private:
 	void CommandCompleted (TXHCITRB *pCommandTRB, u8 uchCompletionCode, u8 uchSlotID);
 	friend class CXHCIEventManager;
 
+	// Abort a stuck command ring after a command timeout (xHCI 4.6.1.2). Sets
+	// CMD_RING_ABORT in CRCR and waits for CMD_RING_RUNNING to clear so the
+	// controller can run commands again. Mirrors Linux xhci_abort_cmd_ring.
+	void AbortCommandRing (void);
+
 private:
 	CXHCIDevice	*m_pXHCIDevice;
 	CXHCIMMIOSpace	*m_pMMIO;

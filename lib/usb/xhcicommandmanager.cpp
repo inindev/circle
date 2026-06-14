@@ -213,10 +213,18 @@ int CXHCICommandManager::DoCommand (u32 nControl, u32 nParameter1, u32 nParamete
 	{
 		if (CTimer::Get ()->GetTicks () - nStartTicks >= 3*HZ)
 		{
-#ifdef XHCI_DEBUG
-			CLogger::Get ()->Write (From, LogDebug,
+			CLogger::Get ()->Write (From, LogWarning,
 						"Command timed out (control 0x%X)", nControl);
-#endif
+
+			// Abort the command ring (xHCI 4.6.1.2; mirrors Linux
+			// xhci_abort_cmd_ring). A timed-out command leaves the ring
+			// stopped/unknown; without an abort the NEXT command inherits a
+			// desynced ring and also times out -- a self-feeding wedge that
+			// survives even a device disconnect (every recovery command then
+			// times out too). Writing CMD_RING_ABORT and waiting for
+			// CMD_RING_RUNNING to clear stops the ring so the controller can
+			// run commands again.
+			AbortCommandRing ();
 
 			m_bCommandCompleted = TRUE;
 			m_pCurrentCommandTRB = 0;
@@ -263,4 +271,25 @@ void CXHCICommandManager::CommandCompleted (TXHCITRB *pCommandTRB, u8 uchComplet
 	DataMemBarrier ();
 
 	m_bCommandCompleted = TRUE;
+}
+
+void CXHCICommandManager::AbortCommandRing (void)
+{
+	assert (m_pMMIO != 0);
+
+	// Set CMD_RING_ABORT (CA) in the low dword of CRCR. The controller stops the
+	// running command and (per xHCI 4.6.1.2) generates a Command Completion event
+	// with code Command Ring Stopped; the dequeue pointer is preserved by HW.
+	u32 nCRCR = m_pMMIO->op_read32 (XHCI_REG_OP_CRCR);
+	m_pMMIO->op_write32 (XHCI_REG_OP_CRCR, nCRCR | XHCI_REG_OP_CRCR_CA);
+
+	DataSyncBarrier ();
+
+	// Wait for CMD_RING_RUNNING (CRR) to clear -- the ring has stopped and the
+	// controller can accept commands again. Spec says time this; Linux uses 5 s.
+	if (!m_pMMIO->op_wait32 (XHCI_REG_OP_CRCR, XHCI_REG_OP_CRCR_CRR, 0, 5000000))
+	{
+		CLogger::Get ()->Write (From, LogError,
+					"Command ring abort did not stop the ring");
+	}
 }
