@@ -62,6 +62,40 @@ public:
 	u64 GetSize (void) const;		// in bytes
 	unsigned GetCapacity (void) const;	// in blocks
 
+	// Optical (CD/DVD) support. A USB CD drive enumerates as the same
+	// Mass-Storage / SCSI-transparent / Bulk-Only class as a disk, so it binds
+	// here too; it differs by SCSI peripheral device type (0x05) and 2048-byte
+	// blocks. IsCDROM() lets callers branch; the block size is per-instance.
+	boolean IsCDROM (void) const { return m_bCDROM; }
+	unsigned GetBlockSize (void) const { return m_nBlockSize; }
+
+	// Re-probe optical media: TEST UNIT READY, and (if ready) refresh capacity.
+	// Returns TRUE if media is present and ready. Call when a disc may have been
+	// inserted after Configure() (which runs once, possibly with no disc in).
+	boolean RefreshMedia (void);
+
+	// MMC READ TOC/PMA/ATIP (0x43), format 0: fills pBuffer with the raw TOC
+	// response (a 4-byte header + 8 bytes per track descriptor). bMSF requests
+	// MSF addresses (vs LBA). Returns bytes read, or < 0 on error.
+	int ReadTOC (void *pBuffer, size_t nBufLen, u8 uchStartTrack, boolean bMSF);
+
+	// MMC READ CD (0xBE) for CD-DA audio: reads nFrames sectors starting at LBA
+	// nLBA as raw 2352-byte main-channel frames into pBuffer (must hold
+	// nFrames*2352 bytes). Format is 44100 Hz / 16-bit / stereo. Returns bytes
+	// read (nFrames*2352), or < 0 on error.
+	int ReadCDDA (u32 nLBA, unsigned nFrames, void *pBuffer);
+
+	// MMC SET CD SPEED (0xBB): cap the drive's read speed in kB/s (1x audio is
+	// 176 kB/s). A low cap keeps the spindle slow, which reduces noise and --
+	// important on a bus-powered drive -- peak current draw. Returns TRUE on
+	// success; drives that do not implement the command fail harmlessly.
+	boolean SetCDSpeed (u16 usReadSpeedKBs);
+
+	// SCSI START STOP UNIT (0x1B) with LoEj=1: eject the disc / open the tray.
+	// Best-effort -- can be slow, and drives without a powered tray fail
+	// harmlessly. Returns TRUE on success.
+	boolean Eject (void);
+
 private:
 	int TryRead (void *pBuffer, size_t nCount);
 	int TryWrite (const void *pBuffer, size_t nCount);
@@ -85,6 +119,8 @@ private:
 	unsigned m_nBlockCount;
 	u64 m_ullOffset;
 
+	boolean  m_bCDROM;		// SCSI peripheral device type 0x05
+	unsigned m_nBlockSize;		// 512 for disks, 2048 for CD-ROM
 	u32	 m_nLastSense;		// last logged sense (key<<16|ASC<<8|ASCQ)
 
 	CPartitionManager *m_pPartitionManager;
