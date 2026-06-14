@@ -31,18 +31,8 @@
 
 #define MAX_TRIES	8				// max. read / write attempts
 
-// Command() result classes (mirrors Linux usb_stor transport status). A non-
-// negative result is the byte count. Both error codes are < 0, so existing
-// callers that only test the sign keep treating either as a plain failure; a
-// caller that wants Linux-style escalation can distinguish them:
-//   UMSD_CMD_FAILED  a recoverable/ordinary failure (stall mishandled, CSW bad,
-//                    command rejected) -- retry / soft reset is appropriate.
-//   UMSD_CMD_ERROR   a USB transaction error or timeout -- the device is not
-//                    answering on the bus. Per Linux (USB_STOR_TRANSPORT_ERROR),
-//                    clearing halts / soft reset will NOT restore it; the owner
-//                    must escalate to a port reset (re-enumerate the device).
-#define UMSD_CMD_FAILED		(-1)
-#define UMSD_CMD_ERROR		(-2)
+// UMSD_CMD_FAILED / UMSD_CMD_ERROR result codes are defined in the header
+// (usbmassdevice.h) so callers can distinguish a transaction error.
 
 // USB Mass Storage Bulk-Only Transport
 
@@ -102,6 +92,8 @@ struct TSCSIInquiryResponse
 {
 	u8		PeripheralDeviceType	: 5,
 #define SCSI_PDT_DIRECT_ACCESS_BLOCK	0x00			// SBC-2 command set (or above)
+#define SCSI_PDT_CD_DVD			0x05			// MMC command set (CD/DVD)
+#define SCSI_PDT_OPTICAL_MEMORY		0x07			// MMC optical memory (DVD+RW etc.)
 #define SCSI_PDT_DIRECT_ACCESS_RBC	0x0E			// RBC command set
 			PeripheralQualifier	: 3,		// 0: device is connected to this LUN
 			DeviceTypeModifier	: 7,
@@ -209,6 +201,67 @@ struct TSCSIWrite10
 }
 PACKED;
 
+// MMC READ TOC/PMA/ATIP (10) -- returns the disc's table of contents.
+struct TSCSIReadTOC
+{
+	u8		OperationCode;
+#define SCSI_OP_READ_TOC	0x43
+	u8		MSF;					// bit 1: addresses as MSF
+	u8		Format;					// 0 = TOC
+	u8		Reserved[3];
+	u8		StartingTrack;
+	u16		AllocationLength;			// big endian
+	u8		Control;
+}
+PACKED;
+
+// MMC READ CD (12) -- byte layout per MMC Table 34, byte values matched to a
+// usbmon capture of Linux reading this drive (byte 9 = 0x10, User Data).
+struct TSCSIReadCD
+{
+	u8		OperationCode;
+#define SCSI_OP_READ_CD		0xBE
+	u8		SectorType;				// byte 1: expected sector type
+#define SCSI_READCD_FMT_CDDA	(0x01 << 2)		// Linux format=1 for CD-DA
+	u32		LogicalBlockAddress;			// bytes 2-5, big endian
+	u8		TransferLength[3];			// bytes 6-8, 24-bit block count
+	u8		Selection;				// byte 9: field selection bits
+#define SCSI_READCD_USER_DATA	0x10			// main-channel User Data (2352 B)
+	u8		SubChannelSelection;			// byte 10
+	u8		Control;				// byte 11
+}
+PACKED;
+
+// MMC SET CD SPEED (12) -- caps the logical unit's read/write speed in kB/s.
+struct TSCSISetCDSpeed
+{
+	u8		OperationCode;
+#define SCSI_OP_SET_CD_SPEED	0xBB
+	u8		Reserved1;
+	u16		ReadSpeed;				// kB/s, big endian
+	u16		WriteSpeed;				// kB/s, big endian
+	u8		Reserved2[5];
+	u8		Control;
+}
+PACKED;
+
+// SBC/MMC START STOP UNIT (6) -- spins the medium up/down and, for removable
+// media, loads or ejects it.
+struct TSCSIStartStopUnit
+{
+	u8		OperationCode;
+#define SCSI_OP_START_STOP_UNIT	0x1B
+	u8		Immediate;				// bit 0: return before completion
+	u8		Reserved[2];
+	u8		LoEjStart;				// bit 0 Start, bit 1 LoEj
+#define SCSI_SSU_LOEJ		0x02			// act on the tray (load/eject)
+#define SCSI_SSU_START		0x01			// 1 = load/spin up, 0 = eject/stop
+	u8		Control;
+}
+PACKED;
+
+#define CDDA_FRAME_SIZE		2352			// raw audio bytes per CD sector
+
 CNumberPool CUSBBulkOnlyMassStorageDevice::s_DeviceNumberPool (1);
 
 static const char FromUmsd[] = "umsd";
@@ -244,6 +297,8 @@ CUSBBulkOnlyMassStorageDevice::CUSBBulkOnlyMassStorageDevice (CUSBFunction *pFun
 	m_nCWBTag (0),
 	m_nBlockCount (0),
 	m_ullOffset (0),
+	m_bCDROM (FALSE),
+	m_nBlockSize (UMSD_BLOCK_SIZE),
 	m_nLastSense ((u32) -1),
 	m_pPartitionManager (0),
 	m_nDeviceNumber (0)
@@ -254,7 +309,8 @@ CUSBBulkOnlyMassStorageDevice::~CUSBBulkOnlyMassStorageDevice (void)
 {
 	if (m_nDeviceNumber != 0)
 	{
-		CDeviceNameService::Get ()->RemoveDevice ("umsd", m_nDeviceNumber, TRUE);
+		CDeviceNameService::Get ()->RemoveDevice (m_bCDROM ? "ucd" : "umsd",
+							  m_nDeviceNumber, TRUE);
 
 		s_DeviceNumberPool.FreeNumber (m_nDeviceNumber);
 
@@ -343,14 +399,33 @@ boolean CUSBBulkOnlyMassStorageDevice::Configure (void)
 		return FALSE;
 	}
 
-	if (SCSIInquiryResponse.PeripheralDeviceType != SCSI_PDT_DIRECT_ACCESS_BLOCK)
+	// Accept direct-access block devices (disks, PDT 0x00) and CD-ROM/optical
+	// devices (PDT 0x05). A USB CD drive enumerates as the same Mass-Storage /
+	// SCSI-transparent / Bulk-Only class and uses the same bulk transport; it
+	// differs in 2048-byte blocks (handled below) and the MMC command set.
+	switch (SCSIInquiryResponse.PeripheralDeviceType)
 	{
+	case SCSI_PDT_DIRECT_ACCESS_BLOCK:
+		m_bCDROM = FALSE;
+		break;
+
+	case SCSI_PDT_CD_DVD:
+	case SCSI_PDT_OPTICAL_MEMORY:
+		m_bCDROM = TRUE;
+		break;
+
+	default:
 		CLogger::Get ()->Write (FromUmsd, LogError, "Unsupported device type: 0x%02X", (unsigned) SCSIInquiryResponse.PeripheralDeviceType);
-		
+
 		return FALSE;
 	}
 
-	unsigned nTries = 100;
+	// Wait for the unit to become ready. A disk is ready promptly; a CD drive
+	// with no disc inserted never becomes ready, which is normal — we must still
+	// register the drive so a disc inserted later can be used. So for a CD-ROM,
+	// don't fail on "not ready": fall through with no media (m_nBlockCount 0),
+	// and let capacity be (re)read on demand when a disc is present.
+	unsigned nTries = m_bCDROM ? 30 : 100;	// CD: allow time to spin up, then register anyway
 	while (--nTries)
 	{
 		CTimer::Get ()->MsDelay (100);
@@ -378,58 +453,98 @@ boolean CUSBBulkOnlyMassStorageDevice::Configure (void)
 			     &SCSIRequestSenseResponse7x, sizeof SCSIRequestSenseResponse7x,
 			     TRUE) < 0)
 		{
-			CLogger::Get ()->Write (FromUmsd, LogError, "Request sense failed");
+			if (!m_bCDROM)
+			{
+				CLogger::Get ()->Write (FromUmsd, LogError, "Request sense failed");
 
-			return FALSE;
+				return FALSE;
+			}
 		}
 	}
 
-	if (nTries == 0)
+	boolean bReady = (nTries != 0);
+	if (!bReady && !m_bCDROM)
 	{
 		CLogger::Get ()->Write (FromUmsd, LogError, "Unit is not ready");
 
 		return FALSE;
 	}
 
-	TSCSIReadCapacity10 SCSIReadCapacity;
-	SCSIReadCapacity.OperationCode		= SCSI_OP_READ_CAPACITY10;
-	SCSIReadCapacity.Obsolete		= 0;
-	SCSIReadCapacity.Reserved1		= 0;
-	SCSIReadCapacity.LogicalBlockAddress	= 0;
-	SCSIReadCapacity.Reserved2		= 0;
-	SCSIReadCapacity.PartialMediumIndicator	= 0;
-	SCSIReadCapacity.Reserved3		= 0;
-	SCSIReadCapacity.Control		= SCSI_CONTROL;
-
-	TSCSIReadCapacityResponse SCSIReadCapacityResponse;
-	if (Command (&SCSIReadCapacity, sizeof SCSIReadCapacity,
-		     &SCSIReadCapacityResponse, sizeof SCSIReadCapacityResponse,
-		     TRUE) != (int) sizeof SCSIReadCapacityResponse)
+	if (bReady)
 	{
-		CLogger::Get ()->Write (FromUmsd, LogError, "Read capacity failed");
+		TSCSIReadCapacity10 SCSIReadCapacity;
+		SCSIReadCapacity.OperationCode		= SCSI_OP_READ_CAPACITY10;
+		SCSIReadCapacity.Obsolete		= 0;
+		SCSIReadCapacity.Reserved1		= 0;
+		SCSIReadCapacity.LogicalBlockAddress	= 0;
+		SCSIReadCapacity.Reserved2		= 0;
+		SCSIReadCapacity.PartialMediumIndicator	= 0;
+		SCSIReadCapacity.Reserved3		= 0;
+		SCSIReadCapacity.Control		= SCSI_CONTROL;
 
-		return FALSE;
+		TSCSIReadCapacityResponse SCSIReadCapacityResponse;
+		if (Command (&SCSIReadCapacity, sizeof SCSIReadCapacity,
+			     &SCSIReadCapacityResponse, sizeof SCSIReadCapacityResponse,
+			     TRUE) == (int) sizeof SCSIReadCapacityResponse)
+		{
+			unsigned nBlockSize = le2be32 (SCSIReadCapacityResponse.BlockLengthInBytes);
+			// Disks use 512-byte blocks; CD-ROM media reports 2048. Accept the
+			// device's reported size (stored per-instance) rather than hardcoding.
+			if (nBlockSize != 512 && nBlockSize != 2048)
+			{
+				if (!m_bCDROM)
+				{
+					CLogger::Get ()->Write (FromUmsd, LogError,
+								"Unsupported block size: %u", nBlockSize);
+
+					return FALSE;
+				}
+			}
+			else
+			{
+				m_nBlockSize = nBlockSize;
+			}
+
+			m_nBlockCount = le2be32 (SCSIReadCapacityResponse.ReturnedLogicalBlockAddress);
+			if (m_nBlockCount == (u32) -1)
+			{
+				if (!m_bCDROM)
+				{
+					CLogger::Get ()->Write (FromUmsd, LogError,
+								"Unsupported disk size > 2TB");
+
+					return FALSE;
+				}
+
+				m_nBlockCount = 0;
+			}
+			else
+			{
+				m_nBlockCount++;
+			}
+		}
+		else if (!m_bCDROM)
+		{
+			CLogger::Get ()->Write (FromUmsd, LogError, "Read capacity failed");
+
+			return FALSE;
+		}
+		else
+		{
+			// Pure audio CD: no data capacity, tracks come from the TOC.
+			m_nBlockSize = 2048;
+			m_nBlockCount = 0;
+		}
+	}
+	else
+	{
+		// CD drive with no disc: register anyway, no media yet.
+		m_nBlockSize = 2048;
+		m_nBlockCount = 0;
 	}
 
-	unsigned nBlockSize = le2be32 (SCSIReadCapacityResponse.BlockLengthInBytes);
-	if (nBlockSize != UMSD_BLOCK_SIZE)
-	{
-		CLogger::Get ()->Write (FromUmsd, LogError, "Unsupported block size: %u", nBlockSize);
-
-		return FALSE;
-	}
-
-	m_nBlockCount = le2be32 (SCSIReadCapacityResponse.ReturnedLogicalBlockAddress);
-	if (m_nBlockCount == (u32) -1)
-	{
-		CLogger::Get ()->Write (FromUmsd, LogError, "Unsupported disk size > 2TB");
-
-		return FALSE;
-	}
-
-	m_nBlockCount++;
-
-	CLogger::Get ()->Write (FromUmsd, LogDebug, "Capacity is %u MByte", m_nBlockCount / (0x100000 / UMSD_BLOCK_SIZE));
+	CLogger::Get ()->Write (FromUmsd, LogNotice, "%s: %u blocks of %u bytes",
+				m_bCDROM ? "CD-ROM" : "disk", m_nBlockCount, m_nBlockSize);
 
 	unsigned nDeviceNumber = s_DeviceNumberPool.AllocateNumber (FALSE);
 	if (nDeviceNumber == CNumberPool::Invalid)
@@ -442,18 +557,24 @@ boolean CUSBBulkOnlyMassStorageDevice::Configure (void)
 	assert (m_nDeviceNumber == 0);
 	m_nDeviceNumber = nDeviceNumber;
 
+	// CD-ROM registers as "ucd<N>"; a disk as "umsd<N>". CDs have no PC-style
+	// partition map (and no media may be present), so skip the partition
+	// manager for optical devices.
 	CString DeviceName;
-	DeviceName.Format ("umsd%u", m_nDeviceNumber);
+	DeviceName.Format (m_bCDROM ? "ucd%u" : "umsd%u", m_nDeviceNumber);
 
-	assert (m_pPartitionManager == 0);
-	m_pPartitionManager = new CPartitionManager (this, DeviceName);
-	assert (m_pPartitionManager != 0);
-	if (!m_pPartitionManager->Initialize ())
+	if (!m_bCDROM)
 	{
-		s_DeviceNumberPool.FreeNumber (m_nDeviceNumber);
-		m_nDeviceNumber = 0;
+		assert (m_pPartitionManager == 0);
+		m_pPartitionManager = new CPartitionManager (this, DeviceName);
+		assert (m_pPartitionManager != 0);
+		if (!m_pPartitionManager->Initialize ())
+		{
+			s_DeviceNumberPool.FreeNumber (m_nDeviceNumber);
+			m_nDeviceNumber = 0;
 
-		return FALSE;
+			return FALSE;
+		}
 	}
 
 	CDeviceNameService::Get ()->AddDevice (DeviceName, this, TRUE);
@@ -520,10 +641,9 @@ u64 CUSBBulkOnlyMassStorageDevice::Seek (u64 ullOffset)
 
 u64 CUSBBulkOnlyMassStorageDevice::GetSize (void) const
 {
-	assert (m_nBlockCount > 0);
 	assert (m_nBlockCount < (u32) -1);
 
-	return (u64) m_nBlockCount << UMSD_BLOCK_SHIFT;
+	return (u64) m_nBlockCount * m_nBlockSize;
 }
 
 unsigned CUSBBulkOnlyMassStorageDevice::GetCapacity (void) const
@@ -531,22 +651,183 @@ unsigned CUSBBulkOnlyMassStorageDevice::GetCapacity (void) const
 	return m_nBlockCount;
 }
 
+boolean CUSBBulkOnlyMassStorageDevice::RefreshMedia (void)
+{
+	// TEST UNIT READY: is media present and spun up?
+	TSCSITestUnitReady SCSITestUnitReady;
+	SCSITestUnitReady.OperationCode = SCSI_OP_TEST_UNIT_READY;
+	SCSITestUnitReady.Reserved	= 0;
+	SCSITestUnitReady.Control	= SCSI_CONTROL;
+
+	if (Command (&SCSITestUnitReady, sizeof SCSITestUnitReady, 0, 0, FALSE) < 0)
+	{
+		// Not ready (no disc, or spinning up). Clear any stale capacity.
+		m_nBlockCount = 0;
+		return FALSE;
+	}
+
+	// Ready: refresh data capacity. (A pure audio disc has no addressable data
+	// blocks and may report 0 / fail here — that's fine; its tracks come from
+	// the TOC, not READ CAPACITY.)
+	TSCSIReadCapacity10 SCSIReadCapacity;
+	SCSIReadCapacity.OperationCode		= SCSI_OP_READ_CAPACITY10;
+	SCSIReadCapacity.Obsolete		= 0;
+	SCSIReadCapacity.Reserved1		= 0;
+	SCSIReadCapacity.LogicalBlockAddress	= 0;
+	SCSIReadCapacity.Reserved2		= 0;
+	SCSIReadCapacity.PartialMediumIndicator	= 0;
+	SCSIReadCapacity.Reserved3		= 0;
+	SCSIReadCapacity.Control		= SCSI_CONTROL;
+
+	TSCSIReadCapacityResponse SCSIReadCapacityResponse;
+	if (Command (&SCSIReadCapacity, sizeof SCSIReadCapacity,
+		     &SCSIReadCapacityResponse, sizeof SCSIReadCapacityResponse,
+		     TRUE) == (int) sizeof SCSIReadCapacityResponse)
+	{
+		unsigned nBlockSize = le2be32 (SCSIReadCapacityResponse.BlockLengthInBytes);
+		if (nBlockSize == 512 || nBlockSize == 2048)
+			m_nBlockSize = nBlockSize;
+		m_nBlockCount = le2be32 (SCSIReadCapacityResponse.ReturnedLogicalBlockAddress);
+		if (m_nBlockCount != (u32) -1)
+			m_nBlockCount++;
+		else
+			m_nBlockCount = 0;
+	}
+	else
+	{
+		m_nBlockCount = 0;		// audio-only disc or no data capacity
+	}
+
+	return TRUE;
+}
+
+int CUSBBulkOnlyMassStorageDevice::ReadTOC (void *pBuffer, size_t nBufLen,
+					   u8 uchStartTrack, boolean bMSF)
+{
+	assert (pBuffer != 0);
+
+	// Request the full buffer; the device returns only as much TOC as exists and
+	// (per the BOT spec) may stall the IN endpoint to terminate the short
+	// response. Command() handles that stall and reports the actual bytes
+	// received via the CSW data residue -- so over-requesting is fine.
+	TSCSIReadTOC SCSIReadTOC;
+	SCSIReadTOC.OperationCode  = SCSI_OP_READ_TOC;
+	SCSIReadTOC.MSF		   = bMSF ? 0x02 : 0x00;		// bit 1 = MSF
+	SCSIReadTOC.Format	   = 0;				// 0 = TOC
+	SCSIReadTOC.Reserved[0]	   = 0;
+	SCSIReadTOC.Reserved[1]	   = 0;
+	SCSIReadTOC.Reserved[2]	   = 0;
+	SCSIReadTOC.StartingTrack  = uchStartTrack;
+	SCSIReadTOC.AllocationLength = le2be16 ((u16) nBufLen);
+	SCSIReadTOC.Control	   = SCSI_CONTROL;
+
+	int nResult = Command (&SCSIReadTOC, sizeof SCSIReadTOC, pBuffer, nBufLen, TRUE);
+	if (nResult < 0)
+		CLogger::Get ()->Write (FromUmsd, LogWarning, "READ TOC failed");
+
+	return nResult;		// bytes actually returned by the device
+}
+
+int CUSBBulkOnlyMassStorageDevice::ReadCDDA (u32 nLBA, unsigned nFrames, void *pBuffer)
+{
+	assert (pBuffer != 0);
+	assert (nFrames > 0);
+
+	// READ CD (0xBE) for CD-DA: 2352-byte raw frames per Linux cdrom_read_cdda_old().
+	size_t nBufLen = (size_t) nFrames * CDDA_FRAME_SIZE;
+
+	TSCSIReadCD SCSIReadCD;
+	memset (&SCSIReadCD, 0, sizeof SCSIReadCD);
+	SCSIReadCD.OperationCode      = SCSI_OP_READ_CD;
+	SCSIReadCD.SectorType	      = SCSI_READCD_FMT_CDDA;
+	SCSIReadCD.LogicalBlockAddress = le2be32 (nLBA);
+	SCSIReadCD.TransferLength[0]  = (u8) (nFrames >> 16);		// 24-bit big endian
+	SCSIReadCD.TransferLength[1]  = (u8) (nFrames >> 8);
+	SCSIReadCD.TransferLength[2]  = (u8) (nFrames);
+	SCSIReadCD.Selection	      = SCSI_READCD_USER_DATA;
+	SCSIReadCD.SubChannelSelection = 0;
+	SCSIReadCD.Control	      = SCSI_CONTROL;
+
+	// Retry with BOT Reset Recovery in between, like Read() does for disks.
+	// CD-DA reads are long bulk-IN transfers on a spinning drive; a transient
+	// ORDINARY failure (bad sector, drive busy) must not end playback. But a
+	// TRANSACTION ERROR (UMSD_CMD_ERROR) means the device is not responding --
+	// soft reset cannot recover it (Linux: USB_STOR_TRANSPORT_ERROR), and looping
+	// the reset just blocks. Stop immediately and propagate UMSD_CMD_ERROR so the
+	// owner can escalate to a port reset.
+	unsigned nTries = MAX_TRIES;
+	do
+	{
+		int nResult = Command (&SCSIReadCD, sizeof SCSIReadCD, pBuffer, nBufLen, TRUE);
+		if (nResult == (int) nBufLen)
+		{
+			return nResult;		// bytes read = nFrames * 2352
+		}
+
+		if (nResult == UMSD_CMD_ERROR)
+		{
+			return UMSD_CMD_ERROR;	// not recoverable here -- owner port-resets
+		}
+
+		if (Reset () != 0)
+		{
+			break;			// device unreachable, retrying is pointless
+		}
+	}
+	while (--nTries > 0);
+
+	CLogger::Get ()->Write (FromUmsd, LogWarning, "READ CD (audio) failed");
+
+	return UMSD_CMD_FAILED;
+}
+
+boolean CUSBBulkOnlyMassStorageDevice::SetCDSpeed (u16 usReadSpeedKBs)
+{
+	TSCSISetCDSpeed SCSISetCDSpeed;
+	memset (&SCSISetCDSpeed, 0, sizeof SCSISetCDSpeed);
+	SCSISetCDSpeed.OperationCode = SCSI_OP_SET_CD_SPEED;
+	SCSISetCDSpeed.ReadSpeed     = le2be16 (usReadSpeedKBs);
+	SCSISetCDSpeed.WriteSpeed    = le2be16 (0xFFFF);	// don't restrict writing
+	SCSISetCDSpeed.Control	     = SCSI_CONTROL;
+
+	return Command (&SCSISetCDSpeed, sizeof SCSISetCDSpeed, 0, 0, FALSE) >= 0;
+}
+
+boolean CUSBBulkOnlyMassStorageDevice::Eject (void)
+{
+	// START STOP UNIT with LoEj=1, Start=0: open the tray / eject the disc. The
+	// drive may take a moment and answer the CSW only once the mechanism settles,
+	// so this can be slow; the caller treats it as best-effort.
+	TSCSIStartStopUnit SCSIStartStopUnit;
+	memset (&SCSIStartStopUnit, 0, sizeof SCSIStartStopUnit);
+	SCSIStartStopUnit.OperationCode = SCSI_OP_START_STOP_UNIT;
+	SCSIStartStopUnit.LoEjStart	= SCSI_SSU_LOEJ;	// LoEj=1, Start=0 -> eject
+	SCSIStartStopUnit.Control	= SCSI_CONTROL;
+
+	// Media is now (being) removed: drop the stale data capacity.
+	m_nBlockCount = 0;
+
+	return Command (&SCSIStartStopUnit, sizeof SCSIStartStopUnit, 0, 0, FALSE) >= 0;
+}
+
 int CUSBBulkOnlyMassStorageDevice::TryRead (void *pBuffer, size_t nCount)
 {
 	assert (pBuffer != 0);
 
-	if (   (m_ullOffset & UMSD_BLOCK_MASK) != 0
+	// Offset/count are in bytes and must be a whole number of (per-instance)
+	// blocks: 512 for disks, 2048 for CD-ROM media.
+	if (   (m_ullOffset % m_nBlockSize) != 0
 	    || m_ullOffset > UMSD_MAX_OFFSET)
 	{
 		return -1;
 	}
-	u32 nBlockAddress = (u32) (m_ullOffset >> UMSD_BLOCK_SHIFT);
+	u32 nBlockAddress = (u32) (m_ullOffset / m_nBlockSize);
 
-	if ((nCount & UMSD_BLOCK_MASK) != 0)
+	if ((nCount % m_nBlockSize) != 0)
 	{
 		return -1;
 	}
-	u16 usTransferLength = (u16) (nCount >> UMSD_BLOCK_SHIFT);
+	u16 usTransferLength = (u16) (nCount / m_nBlockSize);
 
 	//CLogger::Get ()->Write (FromUmsd, LogDebug, "TryRead %u/0x%X/%u", nBlockAddress, (unsigned) pBuffer, (unsigned) usTransferLength);
 
@@ -572,18 +853,18 @@ int CUSBBulkOnlyMassStorageDevice::TryWrite (const void *pBuffer, size_t nCount)
 {
 	assert (pBuffer != 0);
 
-	if (   (m_ullOffset & UMSD_BLOCK_MASK) != 0
+	if (   (m_ullOffset % m_nBlockSize) != 0
 	    || m_ullOffset > UMSD_MAX_OFFSET)
 	{
 		return -1;
 	}
-	u32 nBlockAddress = (u32) (m_ullOffset >> UMSD_BLOCK_SHIFT);
+	u32 nBlockAddress = (u32) (m_ullOffset / m_nBlockSize);
 
-	if ((nCount & UMSD_BLOCK_MASK) != 0)
+	if ((nCount % m_nBlockSize) != 0)
 	{
 		return -1;
 	}
-	u16 usTransferLength = (u16) (nCount >> UMSD_BLOCK_SHIFT);
+	u16 usTransferLength = (u16) (nCount / m_nBlockSize);
 
 	//CLogger::Get ()->Write (FromUmsd, LogDebug, "TryWrite %u/0x%X/%u", nBlockAddress, (unsigned) pBuffer, (unsigned) usTransferLength);
 
