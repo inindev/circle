@@ -32,6 +32,20 @@
 
 #define UMSD_MAX_OFFSET		0x1FFFFFFFFFFULL		// 2TB
 
+// Command()/ReadCDDA() error result classes (mirrors Linux usb_stor transport
+// status). A non-negative result is the byte count; both error codes are < 0, so
+// callers that only test the sign keep treating either as a plain failure. A
+// caller that wants Linux-style escalation can distinguish them:
+//   UMSD_CMD_FAILED  ordinary/recoverable failure (stall mishandled, CSW bad,
+//                    command rejected) -- a retry / soft reset is appropriate.
+//   UMSD_CMD_ERROR   USB transaction error/timeout, or a desynced CSW -- the
+//                    device is not responding on the bus. Per Linux
+//                    (USB_STOR_TRANSPORT_ERROR), clearing halts / soft reset will
+//                    NOT restore it; the owner must escalate to a port reset
+//                    (re-enumerate the device).
+#define UMSD_CMD_FAILED		(-1)
+#define UMSD_CMD_ERROR		(-2)
+
 class CUSBBulkOnlyMassStorageDevice : public CUSBFunction
 {
 public:
@@ -54,6 +68,13 @@ private:
 
 	int Command (void *pCmdBlk, size_t nCmdBlkLen, void *pBuffer, size_t nBufLen, boolean bIn);
 
+	// Clear a STALL on a bulk endpoint: device-side CLEAR_FEATURE + (on Pi4)
+	// host-side xHCI Reset Endpoint. Required so the next bulk transfer runs
+	// after a short-data-phase stall. Returns TRUE on success.
+	boolean ClearEndpointHalt (CUSBEndpoint *pEndpoint);
+
+	void LogRequestSense (void);
+
 	int Reset (void);
 
 private:
@@ -63,6 +84,8 @@ private:
 	unsigned m_nCWBTag;
 	unsigned m_nBlockCount;
 	u64 m_ullOffset;
+
+	u32	 m_nLastSense;		// last logged sense (key<<16|ASC<<8|ASCQ)
 
 	CPartitionManager *m_pPartitionManager;
 
