@@ -19,6 +19,7 @@
 //
 #include <circle/usb/usbmassdevice.h>
 #include <circle/usb/usbhostcontroller.h>
+#include <circle/usb/xhciendpoint.h>		// CXHCIEndpoint::ResetFromHalted (Pi4)
 #include <circle/devicenameservice.h>
 #include <circle/logger.h>
 #include <circle/timer.h>
@@ -29,6 +30,19 @@
 #include <assert.h>
 
 #define MAX_TRIES	8				// max. read / write attempts
+
+// Command() result classes (mirrors Linux usb_stor transport status). A non-
+// negative result is the byte count. Both error codes are < 0, so existing
+// callers that only test the sign keep treating either as a plain failure; a
+// caller that wants Linux-style escalation can distinguish them:
+//   UMSD_CMD_FAILED  a recoverable/ordinary failure (stall mishandled, CSW bad,
+//                    command rejected) -- retry / soft reset is appropriate.
+//   UMSD_CMD_ERROR   a USB transaction error or timeout -- the device is not
+//                    answering on the bus. Per Linux (USB_STOR_TRANSPORT_ERROR),
+//                    clearing halts / soft reset will NOT restore it; the owner
+//                    must escalate to a port reset (re-enumerate the device).
+#define UMSD_CMD_FAILED		(-1)
+#define UMSD_CMD_ERROR		(-2)
 
 // USB Mass Storage Bulk-Only Transport
 
@@ -199,6 +213,30 @@ CNumberPool CUSBBulkOnlyMassStorageDevice::s_DeviceNumberPool (1);
 
 static const char FromUmsd[] = "umsd";
 
+// Like CUSBHostController::Transfer(), but reports the error class via *pError
+// (USBErrorStall vs. fatal). The BOT data/status phases must distinguish a
+// STALL (a protocol answer, recoverable by clearing the halt) from a
+// transaction error or timeout (the device is not responding; clearing the
+// halt would just block for another timeout period).
+static int TransferWithError (CUSBHostController *pHost, CUSBEndpoint *pEndpoint,
+			      void *pBuffer, unsigned nBufLen, TUSBError *pError)
+{
+	assert (pError != 0);
+
+	CUSBRequest URB (pEndpoint, pBuffer, nBufLen);
+
+	if (!pHost->SubmitBlockingRequest (&URB))
+	{
+		*pError = URB.GetUSBError ();
+
+		return -1;
+	}
+
+	*pError = USBErrorUnknown;
+
+	return URB.GetResultLength ();
+}
+
 CUSBBulkOnlyMassStorageDevice::CUSBBulkOnlyMassStorageDevice (CUSBFunction *pFunction)
 :	CUSBFunction (pFunction),
 	m_pEndpointIn (0),
@@ -206,6 +244,7 @@ CUSBBulkOnlyMassStorageDevice::CUSBBulkOnlyMassStorageDevice (CUSBFunction *pFun
 	m_nCWBTag (0),
 	m_nBlockCount (0),
 	m_ullOffset (0),
+	m_nLastSense ((u32) -1),
 	m_pPartitionManager (0),
 	m_nDeviceNumber (0)
 {
@@ -566,6 +605,84 @@ int CUSBBulkOnlyMassStorageDevice::TryWrite (const void *pBuffer, size_t nCount)
 	return nCount;
 }
 
+void CUSBBulkOnlyMassStorageDevice::LogRequestSense (void)
+{
+	TSCSIRequestSense SCSIRequestSense;
+	SCSIRequestSense.OperationCode	  = SCSI_REQUEST_SENSE;
+	SCSIRequestSense.DescriptorFormat = 0;
+	SCSIRequestSense.Reserved1	  = 0;
+	SCSIRequestSense.Reserved2	  = 0;
+	SCSIRequestSense.AllocationLength = sizeof (TSCSIRequestSenseResponse7x);
+	SCSIRequestSense.Control	  = SCSI_CONTROL;
+
+	TSCSIRequestSenseResponse7x Response;
+	if (Command (&SCSIRequestSense, sizeof SCSIRequestSense,
+		     &Response, sizeof Response, TRUE) < 0)
+	{
+		return;
+	}
+
+	// Polling loops (e.g. TEST UNIT READY while a disc spins up) yield the same
+	// sense many times per second; log only when it changes.
+	u32 nSense =   (u32) Response.SenseKey << 16
+		     | (u32) Response.AdditionalSenseCode << 8
+		     | Response.AdditionalSenseCodeQualifier;
+	if (nSense == m_nLastSense)
+	{
+		return;
+	}
+	m_nLastSense = nSense;
+
+	CLogger::Get ()->Write (FromUmsd, LogDebug,
+				"Sense key 0x%02X ASC 0x%02X ASCQ 0x%02X",
+				(unsigned) Response.SenseKey,
+				(unsigned) Response.AdditionalSenseCode,
+				(unsigned) Response.AdditionalSenseCodeQualifier);
+}
+
+// Clear a halt (STALL) condition on a bulk endpoint. Two parts are required:
+//   1. CLEAR_FEATURE(ENDPOINT_HALT) tells the *device* to un-halt and reset its
+//      data toggle (USB 2.0 9.4.5). ResetPID() mirrors that on our side.
+//   2. On xHCI (Pi4) the *host controller* keeps its own per-endpoint state: a
+//      STALL moves the endpoint to the Halted state, and no further transfers
+//      run until a Reset Endpoint command + Set TR Dequeue Pointer are issued.
+//      CLEAR_FEATURE alone does NOT do this -- the next Transfer() just times
+//      out (3s) waiting on a ring the controller will not run. CXHCIEndpoint::
+//      ResetFromHalted() issues exactly those two TRBs. This is the same
+//      recovery CUSBFloppyDiskDevice uses (usbfloppydevice.cpp). Without it,
+//      READ TOC / other short-response commands stall the data phase and then
+//      hang the CSW read. Returns TRUE on success.
+boolean CUSBBulkOnlyMassStorageDevice::ClearEndpointHalt (CUSBEndpoint *pEndpoint)
+{
+	assert (pEndpoint != 0);
+
+	CUSBHostController *pHost = GetHost ();
+	assert (pHost != 0);
+
+	boolean bIn = pEndpoint->IsDirectionIn ();
+
+	if (pHost->ControlMessage (GetEndpoint0 (),
+				   REQUEST_TO_ENDPOINT | REQUEST_OUT, CLEAR_FEATURE,
+				   ENDPOINT_HALT,
+				   pEndpoint->GetNumber () | (bIn ? 0x80 : 0x00), 0, 0) < 0)
+	{
+		return FALSE;
+	}
+
+	pEndpoint->ResetPID ();
+
+#if RASPPI >= 4
+	// Host-side xHCI recovery: take the endpoint out of Halted and re-point its
+	// transfer ring. Required for the next bulk transfer (the CSW) to run.
+	if (!pEndpoint->GetXHCIEndpoint ()->ResetFromHalted ())
+	{
+		return FALSE;
+	}
+#endif
+
+	return TRUE;
+}
+
 int CUSBBulkOnlyMassStorageDevice::Command (void *pCmdBlk, size_t nCmdBlkLen,
 					    void *pBuffer, size_t nBufLen, boolean bIn)
 {
@@ -593,11 +710,16 @@ int CUSBBulkOnlyMassStorageDevice::Command (void *pCmdBlk, size_t nCmdBlkLen,
 	{
 		CLogger::Get ()->Write (FromUmsd, LogError, "CBW transfer failed");
 
-		return -1;
+		// The device did not accept the command block: a transaction error,
+		// not a recoverable stall. Signal escalation (port reset).
+		return UMSD_CMD_ERROR;
 	}
 
-	int nResult = 0;
-	
+	// --- Data phase ---------------------------------------------------------
+	// BOT case 13 (Hi > Di): variable-length IN responses (READ TOC, INQUIRY)
+	// may end with a bulk STALL. That is not an error -- clear the halt and let
+	// the CSW report the actual byte count via dCSWDataResidue. Mirrors Linux
+	// usb_stor_Bulk_transport() + usb_stor_clear_halt().
 	if (nBufLen > 0)
 	{
 		assert (pBuffer != 0);
@@ -614,15 +736,41 @@ int CUSBBulkOnlyMassStorageDevice::Command (void *pCmdBlk, size_t nCmdBlkLen,
 			}
 		}
 
-		nResult = pHost->Transfer (bIn ? m_pEndpointIn : m_pEndpointOut,
-					   pDMABuffer != 0 ? pDMABuffer : pBuffer, nBufLen);
-		if (nResult < 0)
+		TUSBError Error;
+		int nData = TransferWithError (pHost, bIn ? m_pEndpointIn : m_pEndpointOut,
+					       pDMABuffer != 0 ? pDMABuffer : pBuffer, nBufLen,
+					       &Error);
+		if (nData < 0 && Error != USBErrorStall)
 		{
-			CLogger::Get ()->Write (FromUmsd, LogError, "Data transfer failed");
+			// Transaction error or timeout: the device is not answering on
+			// the bus. Abort without touching the pipes (Linux:
+			// USB_STOR_XFER_ERROR -> USB_STOR_TRANSPORT_ERROR, no CSW read);
+			// the owner escalates to a port reset (clearing halts won't help).
+			CLogger::Get ()->Write (FromUmsd, LogWarning, "Data transfer failed");
 
 			delete [] pDMABuffer;
 
-			return -1;
+			return UMSD_CMD_ERROR;
+		}
+
+		if (nData < 0)
+		{
+			// STALL terminating a short data phase (BOT case Hi > Di): clear
+			// the halt and let the CSW report the actual byte count. If the
+			// halt cannot be cleared, the pipe is still wedged host-side --
+			// reading the CSW on it would just burn the full transfer timeout
+			// before failing. Match Linux usb_stor_Bulk_transport (data-phase
+			// clear_halt failure -> USB_STOR_XFER_ERROR, no CSW read) and
+			// escalate to a port reset instead.
+			if (!ClearEndpointHalt (bIn ? m_pEndpointIn : m_pEndpointOut))
+			{
+				CLogger::Get ()->Write (FromUmsd, LogWarning,
+							"Cannot clear halt after data STALL");
+
+				delete [] pDMABuffer;
+
+				return UMSD_CMD_ERROR;
+			}
 		}
 
 		if (pDMABuffer != 0)
@@ -636,61 +784,80 @@ int CUSBBulkOnlyMassStorageDevice::Command (void *pCmdBlk, size_t nCmdBlkLen,
 		}
 	}
 
+	// --- Status phase (get CSW) --------------------------------------------
 	DMA_BUFFER (u8, CSWBuffer, sizeof (TCSW));
 	TCSW *pCSW = (TCSW *) CSWBuffer;
 
-	if (pHost->Transfer (m_pEndpointIn, pCSW, sizeof *pCSW) != (int) sizeof *pCSW)
+	TUSBError CSWError;
+	int nCSW = TransferWithError (pHost, m_pEndpointIn, pCSW, sizeof *pCSW, &CSWError);
+	if (nCSW != (int) sizeof *pCSW)
 	{
-		CLogger::Get ()->Write (FromUmsd, LogError, "CSW transfer failed");
-
-		if (pHost->ControlMessage (GetEndpoint0 (),
-					   REQUEST_TO_ENDPOINT | REQUEST_OUT, CLEAR_FEATURE,
-					   ENDPOINT_HALT, m_pEndpointIn->GetNumber () | 0x80,
-					   0, 0) < 0)
+		// Retry once (Linux: "Attempting to get CSW (2nd try)") -- but only
+		// after a STALL (clear the halt first) or a short read. A transaction
+		// error / timeout means the device is gone; retrying just blocks again,
+		// so signal escalation (port reset) instead.
+		if (nCSW < 0 && CSWError != USBErrorStall)
 		{
+			CLogger::Get ()->Write (FromUmsd, LogError, "CSW transfer failed");
+
+			return UMSD_CMD_ERROR;
+		}
+
+		if (   nCSW < 0
+		    && !ClearEndpointHalt (m_pEndpointIn))
+		{
+			// The halt would not clear -- the endpoint is wedged beyond a soft
+			// recovery; escalate to a port reset.
 			CLogger::Get ()->Write (FromUmsd, LogDebug,
 						"Cannot clear halt on endpoint IN");
 
-			return -1;
+			return UMSD_CMD_ERROR;
 		}
 
-		m_pEndpointIn->ResetPID ();
-
-		if (pHost->Transfer (m_pEndpointIn, pCSW, sizeof *pCSW) != (int) sizeof *pCSW)
+		nCSW = pHost->Transfer (m_pEndpointIn, pCSW, sizeof *pCSW);
+		if (nCSW != (int) sizeof *pCSW)
 		{
-			CLogger::Get ()->Write (FromUmsd, LogError, "CSW transfer failed twice");
+			CLogger::Get ()->Write (FromUmsd, LogError, "CSW transfer failed");
 
-			return -1;
+			return UMSD_CMD_ERROR;
 		}
 	}
 
 	if (pCSW->dCSWSignature != CSWSIGNATURE)
 	{
+		// Got a response, but it is not a CSW: the BOT transport is desynced
+		// (a stale/late response from a prior transfer). A soft retry cannot
+		// resync the tag stream; escalate to a port reset.
 		CLogger::Get ()->Write (FromUmsd, LogError, "CSW signature is wrong");
 
-		return -1;
+		return UMSD_CMD_ERROR;
 	}
 
 	if (pCSW->dCSWTag != m_nCWBTag)
 	{
+		// Wrong tag: also a desynced transport (this CSW belongs to a different
+		// command). Escalate to a port reset to resync.
 		CLogger::Get ()->Write (FromUmsd, LogError, "CSW tag is wrong");
 
-		return -1;
+		return UMSD_CMD_ERROR;
 	}
 
 	if (pCSW->bCSWStatus != CSWSTATUS_PASSED)
 	{
-		return -1;
+		// The device answered and reported the command failed (CHECK CONDITION).
+		// An ordinary failure, not a transport error -- no port reset needed.
+		LogRequestSense ();
+
+		return UMSD_CMD_FAILED;
 	}
 
-	if (pCSW->dCSWDataResidue != 0)
+	u32 nResidue = pCSW->dCSWDataResidue;
+	if (nResidue > (u32) nBufLen)
 	{
-		CLogger::Get ()->Write (FromUmsd, LogError, "Data residue is not 0");
-
-		return -1;
+		nResidue = (u32) nBufLen;
 	}
 
-	return nResult;
+	return (int) (nBufLen - nResidue);
 }
 
 int CUSBBulkOnlyMassStorageDevice::Reset (void)
@@ -702,33 +869,38 @@ int CUSBBulkOnlyMassStorageDevice::Reset (void)
 				   REQUEST_CLASS | REQUEST_TO_INTERFACE | REQUEST_OUT,
 				   BULK_ONLY_MASS_STORAGE_RESET, 0, GetInterfaceNumber (), 0, 0) < 0)
 	{
-		CLogger::Get ()->Write (FromUmsd, LogDebug, "Cannot reset device");
+#if RASPPI >= 4
+		// A transaction error on the control pipe halts EP0 in the xHCI
+		// controller as well; no control transfer runs again until a Reset
+		// Endpoint + Set TR Dequeue Pointer. Recover EP0 and retry once.
+		if (   !GetEndpoint0 ()->GetXHCIEndpoint ()->ResetFromHalted ()
+		    || pHost->ControlMessage (GetEndpoint0 (),
+					      REQUEST_CLASS | REQUEST_TO_INTERFACE | REQUEST_OUT,
+					      BULK_ONLY_MASS_STORAGE_RESET, 0,
+					      GetInterfaceNumber (), 0, 0) < 0)
+#endif
+		{
+			CLogger::Get ()->Write (FromUmsd, LogDebug, "Cannot reset device");
 
-		return -1;
+			return -1;
+		}
 	}
 
 	CTimer::Get ()->MsDelay (100);
 
-	if (pHost->ControlMessage (GetEndpoint0 (),
-				   REQUEST_TO_ENDPOINT | REQUEST_OUT, CLEAR_FEATURE,
-				   ENDPOINT_HALT, m_pEndpointIn->GetNumber () | 0x80, 0, 0) < 0)
+	if (!ClearEndpointHalt (m_pEndpointIn))
 	{
 		CLogger::Get ()->Write (FromUmsd, LogDebug, "Cannot clear halt on endpoint IN");
 
 		return -1;
 	}
 
-	if (pHost->ControlMessage (GetEndpoint0 (),
-				   REQUEST_TO_ENDPOINT | REQUEST_OUT, CLEAR_FEATURE,
-				   ENDPOINT_HALT, m_pEndpointOut->GetNumber (), 0, 0) < 0)
+	if (!ClearEndpointHalt (m_pEndpointOut))
 	{
 		CLogger::Get ()->Write (FromUmsd, LogDebug, "Cannot clear halt on endpoint OUT");
 
 		return -1;
 	}
-
-	m_pEndpointIn->ResetPID ();
-	m_pEndpointOut->ResetPID ();
 
 	return 0;
 }
