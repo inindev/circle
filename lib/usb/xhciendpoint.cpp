@@ -41,6 +41,7 @@ CXHCIEndpoint::CXHCIEndpoint (CXHCIUSBDevice *pDevice, CXHCIDevice *pXHCIDevice)
 	m_pTransferRing (0),
 	m_uchEndpointID (1),
 	m_uchEndpointType (XHCI_EP_CONTEXT_EP_TYPE_CONTROL),
+	m_bResetFailed (FALSE),
 	m_pURB {0, 0},
 	m_bTransferCompleted (TRUE),
 	m_pInputContextBuffer (0)
@@ -67,6 +68,7 @@ CXHCIEndpoint::CXHCIEndpoint (CXHCIUSBDevice *pDevice, const TUSBEndpointDescrip
 	m_pTransferRing (0),
 	m_uchEndpointID (0),
 	m_uchEndpointType (0),
+	m_bResetFailed (FALSE),
 	m_pURB {0, 0},
 	m_bTransferCompleted (TRUE),
 	m_pInputContextBuffer (0)
@@ -441,6 +443,10 @@ void CXHCIEndpoint::TransferEvent (u8 uchCompletionCode, u32 nTransferLength)
 		pURB->SetResultLen (nBufLen - nTransferLength);
 
 		pURB->SetStatus (1);
+
+		// A successful transfer means the endpoint is healthy again -- re-arm
+		// halt recovery (see m_bResetFailed / ResetFromHalted).
+		m_bResetFailed = FALSE;
 	}
 	else if (   uchCompletionCode == XHCI_TRB_COMPLETION_CODE_RING_UNDERRUN
 		 || uchCompletionCode == XHCI_TRB_COMPLETION_CODE_RING_OVERRUN)
@@ -450,8 +456,28 @@ void CXHCIEndpoint::TransferEvent (u8 uchCompletionCode, u32 nTransferLength)
 	}
 	else if (pURB->GetEndpoint ()->GetType () != EndpointTypeIsochronous)
 	{
-		CLogger::Get ()->Write (From, LogWarning, "Transfer error %u on endpoint %u",
-					(unsigned) uchCompletionCode, (unsigned) m_uchEndpointID);
+		pURB->SetStatus (0);
+
+		if (uchCompletionCode == XHCI_TRB_COMPLETION_CODE_STALL_ERROR)
+		{
+			// A STALL is the device's protocol answer (e.g. terminating a
+			// short bulk data phase); the class driver handles it.
+			CLogger::Get ()->Write (From, LogDebug, "Endpoint %u stalled",
+						(unsigned) m_uchEndpointID);
+
+			pURB->SetUSBError (USBErrorStall);
+		}
+		else
+		{
+			CLogger::Get ()->Write (From, LogWarning,
+						"Transfer error %u on endpoint %u",
+						(unsigned) uchCompletionCode,
+						(unsigned) m_uchEndpointID);
+
+			pURB->SetUSBError (uchCompletionCode
+						== XHCI_TRB_COMPLETION_CODE_USB_TRANSACTION_ERROR
+					   ? USBErrorTransaction : USBErrorUnknown);
+		}
 	}
 
 	m_SpinLock.Acquire ();
@@ -468,18 +494,44 @@ boolean CXHCIEndpoint::ResetFromHalted (void)
 	assert (m_pDevice);
 	assert (XHCI_IS_ENDPOINTID (m_uchEndpointID));
 
-	if (!m_pXHCIDevice->GetCommandManager ()->ResetEndpoint (m_pDevice->GetSlotID (),
-								 m_uchEndpointID))
+	// Halt-recovery serialization (Linux EP_HALTED): if a previous reset on this
+	// endpoint already FAILED, don't keep issuing more. Circle's reset is
+	// synchronous, so the danger is REPEATED resets -- one per failed command --
+	// each blocking ~3s and piling commands onto a wedged command ring. Once the
+	// first reset fails we latch m_bResetFailed and refuse further attempts until
+	// a transfer succeeds (TransferEvent clears it) or the endpoint is rebuilt.
+	if (m_bResetFailed)
 	{
 		return FALSE;
 	}
 
+	// Both commands return an xHCI completion CODE, not a boolean. Test it with
+	// XHCI_CMD_SUCCESS (== code 1). A bare `!ResetEndpoint(...)` was wrong: it only
+	// treated code 0 as failure, so a 3s command TIMEOUT (code -2) or any error
+	// code looked like success and we plowed on (reporting success) on a reset
+	// that never happened -- masking a wedged endpoint.
+	int nResult = m_pXHCIDevice->GetCommandManager ()->ResetEndpoint (
+				m_pDevice->GetSlotID (), m_uchEndpointID);
+	if (!XHCI_CMD_SUCCESS (nResult))
+	{
+		m_bResetFailed = TRUE;
+		return FALSE;
+	}
+
 	assert (m_pTransferRing);
-	return m_pXHCIDevice->GetCommandManager ()->SetTRDequeuePointer (
-								m_pDevice->GetSlotID (),
-								m_uchEndpointID,
-								m_pTransferRing->GetEnqueueTRB (),
-								!!m_pTransferRing->GetCycleState ());
+	nResult = m_pXHCIDevice->GetCommandManager ()->SetTRDequeuePointer (
+				m_pDevice->GetSlotID (),
+				m_uchEndpointID,
+				m_pTransferRing->GetEnqueueTRB (),
+				!!m_pTransferRing->GetCycleState ());
+
+	if (!XHCI_CMD_SUCCESS (nResult))
+	{
+		m_bResetFailed = TRUE;
+		return FALSE;
+	}
+
+	return TRUE;
 }
 
 #ifndef NDEBUG
