@@ -75,8 +75,14 @@ CUSBFunction *CUSBDeviceFactory::GetDevice (CUSBFunction *pParent, CString *pNam
 		pResult = new CUSBStandardHub (pParent);
 	}
 #ifndef EXCLUDE_USB_STORAGE
-	else if (pName->Compare ("int8-6-50") == 0)
+	else if (   pParent->GetInterfaceClass () == 0x08	// Mass Storage
+		 && pParent->GetInterfaceProtocol () == 0x50)	// Bulk-Only Transport
 	{
+		// Bind by class + protocol: any Mass-Storage interface using Bulk-Only
+		// Transport, regardless of subclass (1/2/6/...). All these subclasses
+		// carry a SCSI/ATAPI command set over the same transport, so the same
+		// driver handles them; matching only one subclass-specific name left
+		// valid devices unbound.
 		pResult = new CUSBBulkOnlyMassStorageDevice (pParent);
 	}
 	else if (   pName->Compare ("int8-4-0") == 0
