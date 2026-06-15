@@ -231,6 +231,13 @@ boolean CXHCIEndpoint::Transfer (CUSBRequest *pURB, unsigned nTimeoutMs)
 			m_pDevice->DumpStatus ();
 #endif
 
+			// Cancel the in-flight transfer (Linux usb_unlink_urb): without this
+			// the transfer is still live on the ring, and a late device response
+			// lands on a ring we no longer track -> desync of the next transfer.
+			// Stop the endpoint and move its dequeue pointer past the abandoned
+			// TRB so the next transfer starts clean.
+			CancelTransfer ();
+
 			m_SpinLock.Acquire ();
 			m_pURB[0] = m_pURB[1];
 			m_pURB[1] = 0;
@@ -532,6 +539,37 @@ boolean CXHCIEndpoint::ResetFromHalted (void)
 	}
 
 	return TRUE;
+}
+
+boolean CXHCIEndpoint::CancelTransfer (void)
+{
+	assert (m_pXHCIDevice);
+	assert (m_pDevice);
+	assert (XHCI_IS_ENDPOINTID (m_uchEndpointID));
+
+	// Cancel an in-flight transfer after a host-side timeout -- the xHCI
+	// equivalent of Linux usb_unlink_urb(). Without this, a transfer we stopped
+	// waiting on is still live on the controller's transfer ring: when a slow
+	// device finally responds, that late completion lands on a ring we no longer
+	// track and desyncs the next transfer (a stale CSW -> "CSW signature wrong"
+	// -> spiral). Stop Endpoint halts the running transfer; Set TR Dequeue
+	// Pointer then moves the ring past the abandoned TRB so the next transfer
+	// starts clean. Returns TRUE if both commands succeeded.
+	int nResult = m_pXHCIDevice->GetCommandManager ()->StopEndpoint (
+				m_pDevice->GetSlotID (), m_uchEndpointID);
+	if (!XHCI_CMD_SUCCESS (nResult))
+	{
+		return FALSE;
+	}
+
+	assert (m_pTransferRing);
+	nResult = m_pXHCIDevice->GetCommandManager ()->SetTRDequeuePointer (
+				m_pDevice->GetSlotID (),
+				m_uchEndpointID,
+				m_pTransferRing->GetEnqueueTRB (),
+				!!m_pTransferRing->GetCycleState ());
+
+	return XHCI_CMD_SUCCESS (nResult);
 }
 
 #ifndef NDEBUG
