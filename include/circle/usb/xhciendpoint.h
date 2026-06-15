@@ -51,6 +51,7 @@ public:
 	void TransferEvent (u8 uchCompletionCode, u32 nTransferLength);
 
 	boolean ResetFromHalted (void);
+	boolean CancelTransfer (void);		// abort in-flight transfer (timeout)
 
 #ifndef NDEBUG
 	void DumpStatus (void);

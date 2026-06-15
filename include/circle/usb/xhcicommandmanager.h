@@ -44,6 +44,7 @@ public:
 	int ConfigureEndpoint (u8 uchSlotID, TXHCIInputContext *pInputContext, boolean bDeconfigure);
 	int EvaluateContext (u8 uchSlotID, TXHCIInputContext *pInputContext);
 	int ResetEndpoint (u8 uchSlotID, u8 uchEndpointID);
+	int StopEndpoint (u8 uchSlotID, u8 uchEndpointID);
 	int SetTRDequeuePointer (u8 uchSlotID, u8 uchEndpointID, TXHCITRB *pTRB, boolean bDCS);
 	int NoOp (void);
 

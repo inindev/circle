@@ -135,6 +135,19 @@ int CXHCICommandManager::ResetEndpoint (u8 uchSlotID, u8 uchEndpointID)
 	return DoCommand (nControl);
 }
 
+int CXHCICommandManager::StopEndpoint (u8 uchSlotID, u8 uchEndpointID)
+{
+	assert (XHCI_IS_SLOTID (uchSlotID));
+	assert (XHCI_IS_ENDPOINTID (uchEndpointID));
+	// Stop Endpoint and Reset Endpoint command TRBs share the same slot/endpoint
+	// field layout (xHCI spec 6.4.3), so the RESET_ENDPOINT shift constants apply.
+	u32 nControl =   XHCI_TRB_TYPE_CMD_STOP_ENDPOINT << XHCI_TRB_CONTROL_TRB_TYPE__SHIFT
+		       | (u32) uchSlotID << XHCI_CMD_TRB_RESET_ENDPOINT_CONTROL_SLOTID__SHIFT
+		       | (u32) uchEndpointID <<  XHCI_CMD_TRB_RESET_ENDPOINT_CONTROL_ENDPOINTID__SHIFT;
+
+	return DoCommand (nControl);
+}
+
 int CXHCICommandManager::SetTRDequeuePointer (u8 uchSlotID, u8 uchEndpointID, TXHCITRB *pTRB,
 					      boolean bDCS)
 {
