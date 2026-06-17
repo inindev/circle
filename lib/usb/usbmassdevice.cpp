@@ -837,13 +837,13 @@ boolean CUSBBulkOnlyMassStorageDevice::Eject (void)
 // polls Step() instead of the host blocking on completion. Proven on the host
 // first (tools/cdtest_async.c, ASYNC_BOT.md Gate 1a). One command in flight.
 //
-// Stall handling is intentionally simplified vs. Command(): the only async user
-// today is the CD-DA prefetch (READ CD), whose data phase is a clean full
-// transfer (no short-data Hi>Di stall like READ TOC). A data-phase or CSW error
-// is reported as CommandAsyncError so the owner escalates -- it does NOT attempt
-// the in-line clear-halt/2nd-try CSW recovery here (that recovery blocks via
-// ControlMessage; keeping the async path non-blocking is the whole point).
-// READ TOC and the disk path keep using the blocking Command().
+// Stall recovery mirrors Command() / Linux usb_stor_Bulk_transport: a data-phase
+// or CSW STALL is cleared (ClearEndpointHalt) and the CSW is (re)read, so a stall
+// resolves to the device's real status -- e.g. a media-gone read stalls, clears,
+// and the CSW reports CHECK CONDITION -> CommandAsyncFailed. Only a non-stall
+// transaction error, or a clear-halt that itself fails, becomes CommandAsyncError.
+// The clear-halt is a brief EP0 control op on the (rare) stall edge -- Linux does
+// it inline too; the bulk data transfers stay fully async (non-blocking).
 // ===========================================================================
 
 void CUSBBulkOnlyMassStorageDevice::AsyncCompletion (CUSBRequest *pURB,
@@ -977,10 +977,27 @@ CUSBBulkOnlyMassStorageDevice::TCommandAsyncStatus
 		return CommandAsyncBusy;
 
 	case AsyncData:
-		// Record bytes delivered; a data error is escalated (see header note --
-		// no in-line stall recovery on the async path).
 		if (nStatus == 0)
 		{
+			// A bulk-IN/OUT STALL terminating the data phase is NOT fatal -- it is
+			// the device's protocol answer (BOT Hi>Di, or a media-gone read).
+			// Mirror Linux interpret_urb_result/usb_stor_Bulk_transport: clear the
+			// halt and proceed to the CSW, which carries the real status/sense
+			// (e.g. media-not-present -> CHECK CONDITION -> CommandAsyncFailed).
+			// A non-stall error (transaction error), or a clear-halt that itself
+			// fails, is escalated (Linux: USB_STOR_XFER_ERROR -> TRANSPORT_ERROR).
+			if (m_pAsyncURB->GetUSBError () == USBErrorStall
+			    && ClearEndpointHalt (m_bAsyncIn ? m_pEndpointIn : m_pEndpointOut))
+			{
+				m_nAsyncResult = 0;
+				if (!AsyncSubmit (m_pEndpointIn, m_pAsyncCSW, sizeof (TCSW)))
+				{
+					m_AsyncPhase = AsyncIdle;
+					return CommandAsyncError;
+				}
+				m_AsyncPhase = AsyncCSW;
+				return CommandAsyncBusy;
+			}
 			m_AsyncPhase = AsyncIdle;
 			return CommandAsyncError;
 		}
@@ -995,10 +1012,27 @@ CUSBBulkOnlyMassStorageDevice::TCommandAsyncStatus
 
 	case AsyncCSW:
 	case AsyncCSW2:
-		if (nStatus == 0 || nResult != sizeof (TCSW))
+		if (nStatus == 0)
+		{
+			// A STALL reading the CSW: clear the halt and try the CSW once more
+			// (Linux "Attempting to get CSW (2nd try)"), but only on the FIRST
+			// attempt. A 2nd-try failure, a non-stall error, or a failed clear-halt
+			// is a transport error.
+			if (m_AsyncPhase == AsyncCSW
+			    && m_pAsyncURB->GetUSBError () == USBErrorStall
+			    && ClearEndpointHalt (m_pEndpointIn)
+			    && AsyncSubmit (m_pEndpointIn, m_pAsyncCSW, sizeof (TCSW)))
+			{
+				m_AsyncPhase = AsyncCSW2;
+				return CommandAsyncBusy;
+			}
+			m_AsyncPhase = AsyncIdle;
+			return CommandAsyncError;
+		}
+		if (nResult != sizeof (TCSW))
 		{
 			m_AsyncPhase = AsyncIdle;
-			return CommandAsyncError;	// no valid CSW -> transport error
+			return CommandAsyncError;	// short CSW -> transport error
 		}
 		{
 			TCSW *pCSW = (TCSW *) m_pAsyncCSW;
