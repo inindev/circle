@@ -22,6 +22,7 @@
 
 #include <circle/usb/usbfunction.h>
 #include <circle/usb/usbendpoint.h>
+#include <circle/usb/usbrequest.h>
 #include <circle/fs/partitionmanager.h>
 #include <circle/numberpool.h>
 #include <circle/types.h>
@@ -96,6 +97,43 @@ public:
 	// harmlessly. Returns TRUE on success.
 	boolean Eject (void);
 
+	// ---- Async Bulk-Only Transport (non-blocking, tick-driven) -------------
+	//
+	// The blocking Command() above parks core 0 for the whole transfer -- on a
+	// CD that means the whole ~2.8-4.5 s spin-up of the first read, freezing the
+	// UI/VBL/audio. The async path instead submits each BOT phase and returns,
+	// so the owner (core 0's service loop) stays live and polls for completion.
+	// Same phase shape as Command() / Linux usb_stor_Bulk_transport; only the
+	// blocking wait becomes a submit + poll. ONE async command in flight at a
+	// time (the caller serializes). See ASYNC_BOT.md.
+	enum TCommandAsyncStatus
+	{
+		CommandAsyncBusy,	// a phase is in flight; call Step() again later
+		CommandAsyncDone,	// finished OK; result = GetCommandAsyncResult()
+		CommandAsyncFailed,	// ordinary failure (UMSD_CMD_FAILED-class)
+		CommandAsyncError	// transaction error (UMSD_CMD_ERROR-class)
+	};
+
+	// Begin an async command. Returns FALSE if one is already in flight or the
+	// CBW submit fails. pBuffer/nBufLen is the data phase (may be 0). The buffer
+	// must stay valid until Step() reports Done/Failed/Error.
+	boolean CommandAsyncStart (void *pCmdBlk, size_t nCmdBlkLen,
+				   void *pBuffer, size_t nBufLen, boolean bIn);
+
+	// Async READ CD (CD-DA): same CDB as the blocking ReadCDDA(), driven via the
+	// async transport. pBuffer must hold nFrames*2352 bytes (and be DMA-safe) and
+	// stay valid until CommandAsyncStep() reports Done. Drive Step() to completion;
+	// on Done, GetCommandAsyncResult() is the byte count. Returns FALSE if a
+	// command is already in flight.
+	boolean ReadCDDAAsyncStart (u32 nLBA, unsigned nFrames, void *pBuffer);
+
+	// Advance the in-flight async command. Call from the owner's service tick.
+	// Never blocks: returns Busy until the current phase's completion IRQ fires.
+	TCommandAsyncStatus CommandAsyncStep (void);
+
+	// Bytes delivered in the data phase (valid after Step() returns Done).
+	int GetCommandAsyncResult (void) const { return m_nAsyncResult; }
+
 private:
 	int TryRead (void *pBuffer, size_t nCount);
 	int TryWrite (const void *pBuffer, size_t nCount);
@@ -110,6 +148,11 @@ private:
 	void LogRequestSense (void);
 
 	int Reset (void);
+
+	// Async transport internals (see the public async section above).
+	enum TAsyncPhase { AsyncIdle, AsyncCBW, AsyncData, AsyncCSW, AsyncCSW2 };
+	boolean AsyncSubmit (CUSBEndpoint *pEndpoint, void *pBuffer, unsigned nBufLen);
+	static void AsyncCompletion (CUSBRequest *pURB, void *pParam, void *pContext);
 
 private:
 	CUSBEndpoint *m_pEndpointIn;
@@ -127,6 +170,19 @@ private:
 
 	static CNumberPool s_DeviceNumberPool;
 	unsigned m_nDeviceNumber;
+
+	// Async BOT state (one command in flight). m_pAsyncCBW/CSW are cache-aligned
+	// HEAP_DMA30 buffers allocated once (persist across Step() calls, unlike the
+	// stack DMA_BUFFERs in Command()); m_AsyncDone is set by the completion IRQ.
+	TAsyncPhase	  m_AsyncPhase;
+	CUSBRequest	 *m_pAsyncURB;
+	volatile boolean  m_AsyncDone;
+	u8		 *m_pAsyncCBW;		// HEAP_DMA30, sizeof(TCBW)
+	u8		 *m_pAsyncCSW;		// HEAP_DMA30, sizeof(TCSW)
+	void		 *m_pAsyncData;		// caller's data buffer (may be 0)
+	unsigned	  m_nAsyncDataLen;
+	boolean		  m_bAsyncIn;
+	int		  m_nAsyncResult;	// data bytes delivered (Done)
 };
 
 #endif

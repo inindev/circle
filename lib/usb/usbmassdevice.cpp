@@ -19,6 +19,7 @@
 //
 #include <circle/usb/usbmassdevice.h>
 #include <circle/usb/usbhostcontroller.h>
+#include <circle/usb/usbrequest.h>		// CUSBRequest (async BOT)
 #include <circle/usb/xhciendpoint.h>		// CXHCIEndpoint::ResetFromHalted (Pi4)
 #include <circle/devicenameservice.h>
 #include <circle/logger.h>
@@ -301,7 +302,16 @@ CUSBBulkOnlyMassStorageDevice::CUSBBulkOnlyMassStorageDevice (CUSBFunction *pFun
 	m_nBlockSize (UMSD_BLOCK_SIZE),
 	m_nLastSense ((u32) -1),
 	m_pPartitionManager (0),
-	m_nDeviceNumber (0)
+	m_nDeviceNumber (0),
+	m_AsyncPhase (AsyncIdle),
+	m_pAsyncURB (0),
+	m_AsyncDone (FALSE),
+	m_pAsyncCBW (0),
+	m_pAsyncCSW (0),
+	m_pAsyncData (0),
+	m_nAsyncDataLen (0),
+	m_bAsyncIn (FALSE),
+	m_nAsyncResult (0)
 {
 }
 
@@ -316,6 +326,14 @@ CUSBBulkOnlyMassStorageDevice::~CUSBBulkOnlyMassStorageDevice (void)
 
 		m_nDeviceNumber = 0;
 	}
+
+	delete m_pAsyncURB;
+	m_pAsyncURB = 0;
+
+	delete [] m_pAsyncCBW;
+	m_pAsyncCBW = 0;
+	delete [] m_pAsyncCSW;
+	m_pAsyncCSW = 0;
 
 	delete m_pPartitionManager;
 	m_pPartitionManager = 0;
@@ -808,6 +826,231 @@ boolean CUSBBulkOnlyMassStorageDevice::Eject (void)
 	m_nBlockCount = 0;
 
 	return Command (&SCSIStartStopUnit, sizeof SCSIStartStopUnit, 0, 0, FALSE) >= 0;
+}
+
+// ===========================================================================
+// Async Bulk-Only Transport (non-blocking, tick-driven).
+//
+// Same phase shape as the blocking Command() above and Linux
+// usb_stor_Bulk_transport: CBW (bulk-out) -> data (bulk in/out) -> CSW (bulk-in).
+// The difference is purely that each phase is SUBMITTED async and the caller
+// polls Step() instead of the host blocking on completion. Proven on the host
+// first (tools/cdtest_async.c, ASYNC_BOT.md Gate 1a). One command in flight.
+//
+// Stall handling is intentionally simplified vs. Command(): the only async user
+// today is the CD-DA prefetch (READ CD), whose data phase is a clean full
+// transfer (no short-data Hi>Di stall like READ TOC). A data-phase or CSW error
+// is reported as CommandAsyncError so the owner escalates -- it does NOT attempt
+// the in-line clear-halt/2nd-try CSW recovery here (that recovery blocks via
+// ControlMessage; keeping the async path non-blocking is the whole point).
+// READ TOC and the disk path keep using the blocking Command().
+// ===========================================================================
+
+void CUSBBulkOnlyMassStorageDevice::AsyncCompletion (CUSBRequest *pURB,
+						     void *pParam, void *pContext)
+{
+	(void) pURB;
+	(void) pContext;
+	CUSBBulkOnlyMassStorageDevice *pThis = (CUSBBulkOnlyMassStorageDevice *) pParam;
+	pThis->m_AsyncDone = TRUE;
+}
+
+// Submit one bulk transfer on pEndpoint; the completion IRQ sets m_AsyncDone.
+boolean CUSBBulkOnlyMassStorageDevice::AsyncSubmit (CUSBEndpoint *pEndpoint,
+						    void *pBuffer, unsigned nBufLen)
+{
+	delete m_pAsyncURB;			// free the previous phase's URB
+	m_pAsyncURB = new CUSBRequest (pEndpoint, pBuffer, nBufLen);
+	if (m_pAsyncURB == 0)
+	{
+		return FALSE;
+	}
+
+	m_AsyncDone = FALSE;
+	m_pAsyncURB->SetCompletionRoutine (AsyncCompletion, this, 0);
+
+	if (!GetHost ()->SubmitAsyncRequest (m_pAsyncURB))
+	{
+		delete m_pAsyncURB;
+		m_pAsyncURB = 0;
+		return FALSE;
+	}
+
+	return TRUE;
+}
+
+boolean CUSBBulkOnlyMassStorageDevice::CommandAsyncStart (
+	void *pCmdBlk, size_t nCmdBlkLen, void *pBuffer, size_t nBufLen, boolean bIn)
+{
+	assert (pCmdBlk != 0);
+	assert (6 <= nCmdBlkLen && nCmdBlkLen <= 16);
+	assert (nBufLen == 0 || pBuffer != 0);
+
+	if (m_AsyncPhase != AsyncIdle)
+	{
+		return FALSE;			// one command in flight at a time
+	}
+
+	// Lazily allocate the cache-aligned CBW/CSW DMA buffers (persist for the
+	// device lifetime; freed in the destructor). Only CD devices get here.
+	if (m_pAsyncCBW == 0)
+	{
+		m_pAsyncCBW = new (HEAP_DMA30) u8[sizeof (TCBW)];
+		m_pAsyncCSW = new (HEAP_DMA30) u8[sizeof (TCSW)];
+		if (m_pAsyncCBW == 0 || m_pAsyncCSW == 0)
+		{
+			return FALSE;
+		}
+	}
+
+	TCBW *pCBW = (TCBW *) m_pAsyncCBW;
+	memset (pCBW, 0, sizeof *pCBW);
+	pCBW->dCWBSignature	     = CBWSIGNATURE;
+	pCBW->dCWBTag		     = ++m_nCWBTag;
+	pCBW->dCBWDataTransferLength = nBufLen;
+	pCBW->bmCBWFlags	     = bIn ? CBWFLAGS_DATA_IN : 0;
+	pCBW->bCBWLUN		     = CBWLUN;
+	pCBW->bCBWCBLength	     = (u8) nCmdBlkLen;
+	memcpy (pCBW->CBWCB, pCmdBlk, nCmdBlkLen);
+
+	m_pAsyncData	= pBuffer;
+	m_nAsyncDataLen	= nBufLen;
+	m_bAsyncIn	= bIn;
+	m_nAsyncResult	= 0;
+
+	// Submit the CBW.
+	if (!AsyncSubmit (m_pEndpointOut, m_pAsyncCBW, sizeof (TCBW)))
+	{
+		return FALSE;
+	}
+	m_AsyncPhase = AsyncCBW;
+	return TRUE;
+}
+
+CUSBBulkOnlyMassStorageDevice::TCommandAsyncStatus
+	CUSBBulkOnlyMassStorageDevice::CommandAsyncStep (void)
+{
+	if (m_AsyncPhase == AsyncIdle)
+	{
+		return CommandAsyncDone;	// nothing in flight
+	}
+
+	if (!m_AsyncDone)
+	{
+		return CommandAsyncBusy;	// current phase still in flight -- poll later
+	}
+
+	// The current phase completed: check it, then advance. GetResultLength()
+	// asserts on a failed transfer (m_bStatus must be true), so only read it
+	// when the status is success.
+	int  nStatus = m_pAsyncURB->GetStatus ();
+	u32  nResult = nStatus != 0 ? m_pAsyncURB->GetResultLength () : 0;
+
+	switch (m_AsyncPhase)
+	{
+	case AsyncCBW:
+		if (nStatus == 0)
+		{
+			m_AsyncPhase = AsyncIdle;
+			return CommandAsyncError;	// CBW not accepted -> device gone
+		}
+		// CBW out -> data phase (or straight to CSW if no data).
+		if (m_nAsyncDataLen > 0)
+		{
+			if (!AsyncSubmit (m_bAsyncIn ? m_pEndpointIn : m_pEndpointOut,
+					  m_pAsyncData, m_nAsyncDataLen))
+			{
+				m_AsyncPhase = AsyncIdle;
+				return CommandAsyncError;
+			}
+			m_AsyncPhase = AsyncData;
+		}
+		else
+		{
+			if (!AsyncSubmit (m_pEndpointIn, m_pAsyncCSW, sizeof (TCSW)))
+			{
+				m_AsyncPhase = AsyncIdle;
+				return CommandAsyncError;
+			}
+			m_AsyncPhase = AsyncCSW;
+		}
+		return CommandAsyncBusy;
+
+	case AsyncData:
+		// Record bytes delivered; a data error is escalated (see header note --
+		// no in-line stall recovery on the async path).
+		if (nStatus == 0)
+		{
+			m_AsyncPhase = AsyncIdle;
+			return CommandAsyncError;
+		}
+		m_nAsyncResult = (int) nResult;
+		if (!AsyncSubmit (m_pEndpointIn, m_pAsyncCSW, sizeof (TCSW)))
+		{
+			m_AsyncPhase = AsyncIdle;
+			return CommandAsyncError;
+		}
+		m_AsyncPhase = AsyncCSW;
+		return CommandAsyncBusy;
+
+	case AsyncCSW:
+	case AsyncCSW2:
+		if (nStatus == 0 || nResult != sizeof (TCSW))
+		{
+			m_AsyncPhase = AsyncIdle;
+			return CommandAsyncError;	// no valid CSW -> transport error
+		}
+		{
+			TCSW *pCSW = (TCSW *) m_pAsyncCSW;
+			m_AsyncPhase = AsyncIdle;
+			if (pCSW->dCSWSignature != CSWSIGNATURE
+			    || pCSW->dCSWTag != m_nCWBTag)
+			{
+				return CommandAsyncError;	// desynced -> port reset
+			}
+			if (pCSW->bCSWStatus != CSWSTATUS_PASSED)
+			{
+				return CommandAsyncFailed;	// CHECK CONDITION
+			}
+			// Trust the data-phase actual length we recorded; clamp by residue.
+			u32 nResidue = pCSW->dCSWDataResidue;
+			if (nResidue <= m_nAsyncDataLen
+			    && (int) (m_nAsyncDataLen - nResidue) < m_nAsyncResult)
+			{
+				m_nAsyncResult = (int) (m_nAsyncDataLen - nResidue);
+			}
+			return CommandAsyncDone;
+		}
+
+	default:
+		m_AsyncPhase = AsyncIdle;
+		return CommandAsyncError;
+	}
+}
+
+boolean CUSBBulkOnlyMassStorageDevice::ReadCDDAAsyncStart (u32 nLBA,
+							   unsigned nFrames,
+							   void *pBuffer)
+{
+	assert (pBuffer != 0);
+	assert (nFrames > 0);
+
+	// Identical CDB to the blocking ReadCDDA() (READ CD 0xBE, CD-DA). The CDB is
+	// copied into the CBW synchronously by CommandAsyncStart(), so a local is safe.
+	TSCSIReadCD SCSIReadCD;
+	memset (&SCSIReadCD, 0, sizeof SCSIReadCD);
+	SCSIReadCD.OperationCode       = SCSI_OP_READ_CD;
+	SCSIReadCD.SectorType	       = SCSI_READCD_FMT_CDDA;
+	SCSIReadCD.LogicalBlockAddress = le2be32 (nLBA);
+	SCSIReadCD.TransferLength[0]   = (u8) (nFrames >> 16);
+	SCSIReadCD.TransferLength[1]   = (u8) (nFrames >> 8);
+	SCSIReadCD.TransferLength[2]   = (u8) (nFrames);
+	SCSIReadCD.Selection	       = SCSI_READCD_USER_DATA;
+	SCSIReadCD.SubChannelSelection = 0;
+	SCSIReadCD.Control	       = SCSI_CONTROL;
+
+	size_t nBufLen = (size_t) nFrames * CDDA_FRAME_SIZE;
+	return CommandAsyncStart (&SCSIReadCD, sizeof SCSIReadCD, pBuffer, nBufLen, TRUE);
 }
 
 int CUSBBulkOnlyMassStorageDevice::TryRead (void *pBuffer, size_t nCount)
