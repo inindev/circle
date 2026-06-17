@@ -261,6 +261,19 @@ struct TSCSIStartStopUnit
 }
 PACKED;
 
+// SPC PREVENT ALLOW MEDIUM REMOVAL (6) -- lock/unlock the drive's eject
+// mechanism (e.g. the physical eject button) while media is in use.
+struct TSCSIPreventAllow
+{
+	u8		OperationCode;
+#define SCSI_OP_PREVENT_ALLOW	0x1E
+	u8		Reserved[3];
+	u8		Prevent;				// bit 0: 1 = prevent removal
+#define SCSI_PREVENT		0x01
+	u8		Control;
+}
+PACKED;
+
 #define CDDA_FRAME_SIZE		2352			// raw audio bytes per CD sector
 
 CNumberPool CUSBBulkOnlyMassStorageDevice::s_DeviceNumberPool (1);
@@ -826,6 +839,20 @@ boolean CUSBBulkOnlyMassStorageDevice::Eject (void)
 	m_nBlockCount = 0;
 
 	return Command (&SCSIStartStopUnit, sizeof SCSIStartStopUnit, 0, 0, FALSE) >= 0;
+}
+
+boolean CUSBBulkOnlyMassStorageDevice::PreventAllowRemoval (boolean bPrevent)
+{
+	// PREVENT ALLOW MEDIUM REMOVAL: lock (bPrevent) or unlock the drive's eject
+	// mechanism, so removal is host-controlled while media is mounted. Best-effort
+	// -- drives that do not support it fail harmlessly (Linux: US_FL_NOT_LOCKABLE).
+	TSCSIPreventAllow SCSIPreventAllow;
+	memset (&SCSIPreventAllow, 0, sizeof SCSIPreventAllow);
+	SCSIPreventAllow.OperationCode = SCSI_OP_PREVENT_ALLOW;
+	SCSIPreventAllow.Prevent	= bPrevent ? SCSI_PREVENT : 0;
+	SCSIPreventAllow.Control	= SCSI_CONTROL;
+
+	return Command (&SCSIPreventAllow, sizeof SCSIPreventAllow, 0, 0, FALSE) >= 0;
 }
 
 // ===========================================================================
