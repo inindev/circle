@@ -97,6 +97,14 @@ public:
 	// harmlessly. Returns TRUE on success.
 	boolean Eject (void);
 
+	// Recover a wedged Bulk-Only Transport in place, KEEPING the device:
+	// BULK_ONLY_MASS_STORAGE_RESET + clear-halt on both bulk pipes (+ Pi4 EP0
+	// recovery). Mirrors Linux usb_stor_Bulk_reset -- the right recovery after a
+	// transaction error (e.g. an external eject that desyncs the pipe), as opposed
+	// to RemoveDevice() which deletes the device and needs a hub connection edge to
+	// come back. Returns 0 on success, < 0 if the device is unreachable.
+	int Reset (void);
+
 	// ---- Async Bulk-Only Transport (non-blocking, tick-driven) -------------
 	//
 	// The blocking Command() above parks core 0 for the whole transfer -- on a
@@ -146,8 +154,6 @@ private:
 	boolean ClearEndpointHalt (CUSBEndpoint *pEndpoint);
 
 	void LogRequestSense (void);
-
-	int Reset (void);
 
 	// Async transport internals (see the public async section above).
 	enum TAsyncPhase { AsyncIdle, AsyncCBW, AsyncData, AsyncCSW, AsyncCSW2 };
