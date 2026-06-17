@@ -97,6 +97,12 @@ public:
 	// harmlessly. Returns TRUE on success.
 	boolean Eject (void);
 
+	// SPC PREVENT ALLOW MEDIUM REMOVAL (0x1E): lock (bPrevent=TRUE) or unlock the
+	// drive's eject mechanism, so removal is host-controlled while media is in use.
+	// Best-effort; drives that do not implement it fail harmlessly. Returns TRUE on
+	// success.
+	boolean PreventAllowRemoval (boolean bPrevent);
+
 	// Recover a wedged Bulk-Only Transport in place, KEEPING the device:
 	// BULK_ONLY_MASS_STORAGE_RESET + clear-halt on both bulk pipes (+ Pi4 EP0
 	// recovery). Mirrors Linux usb_stor_Bulk_reset -- the right recovery after a
