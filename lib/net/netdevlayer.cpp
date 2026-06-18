@@ -28,10 +28,12 @@
 
 const char FromNetDev[] = "netdev";
 
-CNetDeviceLayer::CNetDeviceLayer (CNetConfig *pNetConfig, TNetDeviceType DeviceType)
+CNetDeviceLayer::CNetDeviceLayer (CNetConfig *pNetConfig, TNetDeviceType DeviceType,
+				  CNetDevice *pInjectedDevice)
 :	m_DeviceType (DeviceType),
 	m_pNetConfig (pNetConfig),
 	m_pDevice (0),
+	m_pInjectedDevice (pInjectedDevice),
 	m_TxQueue (TRUE),
 	m_pRxBuffer (new CNetBuffer (CNetBuffer::Receive, FRAME_BUFFER_SIZE))
 {
@@ -48,33 +50,57 @@ CNetDeviceLayer::~CNetDeviceLayer (void)
 
 boolean CNetDeviceLayer::Initialize (boolean bWaitForActivate)
 {
+	// Injected device: skip the built-in NIC's own Initialize() (its hardware is
+	// brought up by its owner) and bind what we were given. We DO start a CPHYTask
+	// on it -- the injected device is expected to delegate UpdatePHY() to the real
+	// NIC, so the PHY keeps being polled and a link that is down at bind time (e.g.
+	// no cable yet) recovers when it comes up. IsLinkUp() below drives the initial
+	// link wait, also delegated by the injected device.
+	if (m_pInjectedDevice != 0)
+	{
+		assert (m_pDevice == 0);
+		m_pDevice = m_pInjectedDevice;
+
+		new CPHYTask (m_pDevice);
+	}
+	else
+	{
 #if RASPPI == 4
-	if (!m_Bcm54213.Initialize ())
-	{
-		return FALSE;
-	}
+		if (!m_Bcm54213.Initialize ())
+		{
+			return FALSE;
+		}
 #elif RASPPI >= 5
-	if (!m_MACB.Initialize ())
-	{
-		return FALSE;
-	}
+		if (!m_MACB.Initialize ())
+		{
+			return FALSE;
+		}
 #endif
 
+		if (!bWaitForActivate)
+		{
+			return TRUE;
+		}
+
+		assert (m_pDevice == 0);
+		m_pDevice = CNetDevice::GetNetDevice (m_DeviceType);
+		if (m_pDevice == 0)
+		{
+			CLogger::Get ()->Write (FromNetDev, LogError, "Net device not available");
+
+			return FALSE;
+		}
+
+		new CPHYTask (m_pDevice);
+	}
+
+	// The non-injected path above already returned when !bWaitForActivate (binding
+	// deferred to Process()). For the injected path we have just bound the device,
+	// so honor !bWaitForActivate here without re-binding.
 	if (!bWaitForActivate)
 	{
 		return TRUE;
 	}
-
-	assert (m_pDevice == 0);
-	m_pDevice = CNetDevice::GetNetDevice (m_DeviceType);
-	if (m_pDevice == 0)
-	{
-		CLogger::Get ()->Write (FromNetDev, LogError, "Net device not available");
-
-		return FALSE;
-	}
-
-	new CPHYTask (m_pDevice);
 
 	// wait for Ethernet PHY to come up
 	unsigned nStartTicks = CTimer::Get ()->GetTicks ();
@@ -103,13 +129,23 @@ void CNetDeviceLayer::Process (void)
 {
 	if (m_pDevice == 0)
 	{
-		m_pDevice = CNetDevice::GetNetDevice (m_DeviceType);
-		if (m_pDevice == 0)
+		// Prefer the injected device; otherwise lazily bind the built-in NIC as
+		// before. (For the injected case Initialize() already bound it and started
+		// the CPHYTask, so this branch normally does not run.)
+		if (m_pInjectedDevice != 0)
 		{
-			return;
+			m_pDevice = m_pInjectedDevice;
 		}
+		else
+		{
+			m_pDevice = CNetDevice::GetNetDevice (m_DeviceType);
+			if (m_pDevice == 0)
+			{
+				return;
+			}
 
-		new CPHYTask (m_pDevice);
+			new CPHYTask (m_pDevice);
+		}
 	}
 
 	DMA_BUFFER (u8, Buffer, FRAME_BUFFER_SIZE);
