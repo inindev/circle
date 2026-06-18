@@ -141,6 +141,11 @@ public:
 	// command is already in flight.
 	boolean ReadCDDAAsyncStart (u32 nLBA, unsigned nFrames, void *pBuffer);
 
+	// Async eject (START STOP UNIT, LoEj): same as Eject() but non-blocking, so the
+	// caller is not parked for the slow mechanical-eject CSW. Drive CommandAsyncStep()
+	// to completion. Returns FALSE if a command is already in flight.
+	boolean EjectAsyncStart (void);
+
 	// Advance the in-flight async command. Call from the owner's service tick.
 	// Never blocks: returns Busy until the current phase's completion IRQ fires.
 	TCommandAsyncStatus CommandAsyncStep (void);
