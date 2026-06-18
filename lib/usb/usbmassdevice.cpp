@@ -1114,6 +1114,21 @@ boolean CUSBBulkOnlyMassStorageDevice::ReadCDDAAsyncStart (u32 nLBA,
 	return CommandAsyncStart (&SCSIReadCD, sizeof SCSIReadCD, pBuffer, nBufLen, TRUE);
 }
 
+boolean CUSBBulkOnlyMassStorageDevice::EjectAsyncStart (void)
+{
+	// Same CDB as the blocking Eject() (START STOP UNIT, LoEj=1 Start=0), driven via
+	// the async transport so the caller is not blocked for the (slow, mechanical)
+	// eject CSW. No data phase. Drive CommandAsyncStep() to completion.
+	TSCSIStartStopUnit SCSIStartStopUnit;
+	memset (&SCSIStartStopUnit, 0, sizeof SCSIStartStopUnit);
+	SCSIStartStopUnit.OperationCode = SCSI_OP_START_STOP_UNIT;
+	SCSIStartStopUnit.LoEjStart	= SCSI_SSU_LOEJ;	// LoEj=1, Start=0 -> eject
+	SCSIStartStopUnit.Control	= SCSI_CONTROL;
+
+	m_nBlockCount = 0;	// media is (being) removed: drop stale capacity
+	return CommandAsyncStart (&SCSIStartStopUnit, sizeof SCSIStartStopUnit, 0, 0, FALSE);
+}
+
 int CUSBBulkOnlyMassStorageDevice::TryRead (void *pBuffer, size_t nCount)
 {
 	assert (pBuffer != 0);
