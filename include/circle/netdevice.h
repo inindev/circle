@@ -89,6 +89,12 @@ public:
 	/// \return FALSE if not supported
 	virtual boolean SetMulticastFilter (const u8 Groups[][MAC_ADDRESS_SIZE]) { return FALSE; }
 
+	/// \brief Enable or disable promiscuous mode (receive all frames, regardless
+	///	   of destination MAC address)
+	/// \param bEnable TRUE to receive all frames, FALSE for normal filtering
+	/// \return FALSE if not supported
+	virtual boolean SetPromiscuousMode (boolean bEnable) { return FALSE; }
+
 	/// \param Speed A value returned by GetLinkSpeed()
 	/// \return Description for this speed value
 	static const char *GetSpeedString (TNetDeviceSpeed Speed);
