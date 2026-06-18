@@ -563,8 +563,34 @@ void CUSBStandardHub::HandlePortStatusChange (void)
 		//CLogger::Get ()->Write (FromHub, LogDebug, "Change status is 0x%04X (port %u)",
 		//			(unsigned) usChangeStatus, nPort+1);
 
-		assert (!(usChangeStatus & C_PORT_SUSPEND__MASK));	// TODO
-		assert (!(usChangeStatus & C_PORT_OVER_CURRENT__MASK));	// TODO
+		if (usChangeStatus & C_PORT_SUSPEND__MASK)
+		{
+			// Acknowledge the resume/suspend-change; we do not drive remote
+			// wakeup, so just clear the change so it stops being reported.
+			GetHost ()->ControlMessage (GetEndpoint0 (),
+				REQUEST_OUT | REQUEST_CLASS | REQUEST_TO_OTHER,
+				CLEAR_FEATURE, C_PORT_SUSPEND, nPort+1, 0, 0);
+		}
+
+		if (usChangeStatus & C_PORT_OVER_CURRENT__MASK)
+		{
+			// Over-current change: handle it, do NOT crash. Mirror Linux hub.c
+			// port_event() / USB 2.0 11.12.5: acknowledge the change, wait for the
+			// condition to settle, then re-power the port.
+			GetHost ()->ControlMessage (GetEndpoint0 (),
+				REQUEST_OUT | REQUEST_CLASS | REQUEST_TO_OTHER,
+				CLEAR_FEATURE, C_PORT_OVER_CURRENT, nPort+1, 0, 0);
+
+			CLogger::Get ()->Write (FromHub, LogWarning,
+						"Over-current change on port %u -- re-powering",
+						nPort+1);
+
+			CTimer::Get ()->MsDelay (100);		// cool-down
+
+			GetHost ()->ControlMessage (GetEndpoint0 (),
+				REQUEST_OUT | REQUEST_CLASS | REQUEST_TO_OTHER,
+				SET_FEATURE, PORT_POWER, nPort+1, 0, 0);
+		}
 
 		if (usChangeStatus & C_PORT_ENABLE__MASK)
 		{
