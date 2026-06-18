@@ -31,7 +31,14 @@
 class CNetDeviceLayer
 {
 public:
-	CNetDeviceLayer (CNetConfig *pNetConfig, TNetDeviceType DeviceType);
+	// pInjectedDevice (optional): bind this CNetDevice instead of constructing
+	// and initializing the built-in on-board NIC. When 0 (default), behaves as
+	// before -- builds/binds the SoC Ethernet (Bcm54213 / MACB). Supplying a
+	// device lets a caller run the IP stack over a virtual/shared NIC (e.g. a
+	// demux shim over a NIC that is also used for raw frames) without a second
+	// hardware driver instance fighting for the same NIC.
+	CNetDeviceLayer (CNetConfig *pNetConfig, TNetDeviceType DeviceType,
+			 CNetDevice *pInjectedDevice = 0);
 	~CNetDeviceLayer (void);
 
 	boolean Initialize (boolean bWaitForActivate);
@@ -53,6 +60,7 @@ private:
 	TNetDeviceType m_DeviceType;
 	CNetConfig *m_pNetConfig;
 	CNetDevice *m_pDevice;
+	CNetDevice *m_pInjectedDevice;		// non-0: use this, skip the built-in NIC
 
 	CNetBufferQueue m_TxQueue;
 	CNetBufferQueue m_RxQueue;

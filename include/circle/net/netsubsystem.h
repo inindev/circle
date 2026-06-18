@@ -40,7 +40,10 @@ public:
 		       const u8 *pDefaultGateway = 0,
 		       const u8 *pDNSServer      = 0,
 		       const char *pHostname	 = DEFAULT_HOSTNAME,	// 0 for no hostname
-		       TNetDeviceType DeviceType = NetDeviceTypeEthernet);
+		       TNetDeviceType DeviceType = NetDeviceTypeEthernet,
+		       // Optional: run the stack over this device instead of the
+		       // built-in on-board NIC (e.g. a demux shim). 0 = built-in.
+		       CNetDevice *pInjectedDevice = 0);
 	~CNetSubSystem (void);
 	
 	boolean Initialize (boolean bWaitForActivate = TRUE);
