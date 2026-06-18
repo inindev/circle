@@ -97,6 +97,8 @@ public:
 
 	boolean SetMulticastFilter (const u8 Groups[][MAC_ADDRESS_SIZE]);
 
+	boolean SetPromiscuousMode (boolean bEnable);
+
 private:
 	// UMAC
 	void reset_umac(void);

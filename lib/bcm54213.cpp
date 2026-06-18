@@ -929,6 +929,31 @@ boolean CBcm54213Device::SetMulticastFilter (const u8 Groups[][MAC_ADDRESS_SIZE]
 	return TRUE;
 }
 
+boolean CBcm54213Device::SetPromiscuousMode (boolean bEnable)
+{
+	if (bEnable)
+	{
+		// Mirror the Linux GENET driver (bcmgenet_set_rx_mode IFF_PROMISC path):
+		// setting CMD_PROMISC is NOT sufficient on its own -- the MAC Destination
+		// Filter (MDF) is applied regardless and would still drop frames whose dest
+		// MAC is not in it. So also disable the MDF by writing 0 to UMAC_MDF_CTRL.
+		u32 reg = umac_readl (UMAC_CMD);
+		reg |= CMD_PROMISC;
+		umac_writel (reg, UMAC_CMD);
+		umac_writel (0, UMAC_MDF_CTRL);		// disable the destination filter
+	}
+	else
+	{
+		// Clear CMD_PROMISC and restore the normal filter (broadcast + own MAC).
+		u32 reg = umac_readl (UMAC_CMD);
+		reg &= ~CMD_PROMISC;
+		umac_writel (reg, UMAC_CMD);
+		set_rx_mode ();				// reprograms + re-enables the MDF
+	}
+
+	return TRUE;
+}
+
 void CBcm54213Device::reset_umac(void)
 {
 	// 7358a0/7552a0: bad default in RBUF_FLUSH_CTRL.umac_sw_rst
