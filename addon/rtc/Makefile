@@ -4,7 +4,7 @@
 
 CIRCLEHOME = ../..
 
-OBJS	= firmwarertc.o mcp7941x.o
+OBJS	= firmwarertc.o mcp7941x.o ds3231.o
 
 librtc.a: $(OBJS)
 	@echo "  AR    $@"
